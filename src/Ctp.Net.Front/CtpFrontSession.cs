@@ -249,9 +249,9 @@ internal sealed class CtpFrontSession : IDisposable
     private void OnRpcTradePushed(Aether.Exchange.Trade trade)
     {
         if (_state != State.Authenticated) return;
-        _log($"[CTP-Front] → 推送 OnRtnTrade: ref={trade.OrderRef} {trade.Volume}@{trade.Price} id={trade.TradeId}");
+        _log($"[CTP-Front] → 推送 OnRtnTrade: ref={trade.OrderRef} {(char)trade.Direction}{(char)trade.OffsetFlag} {trade.Volume}@{trade.Price} id={trade.TradeId}");
         RoutePush(BuildFrame(CtpFrontTemplates.BuildRtnTrade(NextRtnInstance(), _userId, _brokerId, trade.InstrumentId, trade.OrderRef,
-            trade.TradeId, trade.Price, trade.Volume, _login?.TradingDay ?? "")));
+            trade.TradeId, (char)trade.Direction, (char)trade.OffsetFlag, trade.Price, trade.Volume, _login?.TradingDay ?? "")));
     }
 
     /// <summary>交易所侧连接死亡（host 挂/超时销毁）⇒ 关闭本 CTP 会话（客户端见断线——真实券商行为）。</summary>

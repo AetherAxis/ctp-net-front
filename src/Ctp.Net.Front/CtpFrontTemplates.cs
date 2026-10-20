@@ -577,17 +577,22 @@ internal static class CtpFrontTemplates
         "0103344CE102E2F002E30AE10101E0EFE4040901E0EB39393939E1444345E139E1323437313633E139393939E26D32373031EFEB303030303030303030303033E1323437313633EA444345E635333936EFE230202020202020202039353038E939393939E739393939323437313431E26D32373031EFEB303140AA3AE8013230323630393239E131303A35303A3530E130E139393939636166EE202020202020202034363537E139393939EFEF13433230323630393239E401E2655A30EFE26D32373031E1444345E16D32373031E16D32373031E16DE131E132303237E131E131303030E131E131303030E131E13130E131E13230323630313139E13230323630313139E13230323730313135E132E16D32373031EFEFEFEFEFE1"
     );
 
-    /// <summary>OnRtnTrade（成交回报推送——方向/开平前缀保留捕获形状（边界：非买开成交的方向回显失真））。
+    /// <summary>OnRtnTrade（成交回报推送——<b>开平槽 = offset 119（EB 价格 run 的 "01" 前缀首字节——
+    /// 2026-10-20 实验室钉死：编辑该字节客户端开平回显随之翻转）；方向槽候选 = offset 82（E2+"0"+空格
+    /// 段首字节——④ 的 Trade.Direction 本就是报单归属方的值，⑤ 此前直接丢弃致恒回 BuyOpen ⇒ ⑥ 持仓缓存
+    /// （开平决策数据源）单调膨胀 ⇒ 仓位失控；若本槽实验否证则方向回显为未逆向边界，功能路径 ⑥ 已绕开）</b>。
     /// 价格槽 PriceSlot 等宽（变宽即失步）；<b>量槽 = offset 125（模板 `E8 01` 的值字节——2026-10-17 修正：
     /// 旧版编辑 offset 184（`E4 01`，无关字段——量编辑写错位还污染该字段），SDK 从 E8 后读量 ⇒ 恒读模板
     /// 原值 1——多手成交全被读成 1 手 ⇒ 客户端「报单全成但成交回报缺 N 手」高频幻影补齐（双 bot 实测）；
     /// E2E 此前只测 1 手成交（01=1 恰好吻合）掩盖了偏移错误）</b>；量槽 1B——>255 手时 MinimalInt 2B 撑宽
     /// （bot 量级达不到，未实测边界——等宽纪律下撑宽即失步，如实标注）。</summary>
-    internal static byte[] BuildRtnTrade(int instance, string userId, string brokerId, string instrumentId, string orderRef, string tradeId, double price, int volume, string tradingDay) =>
+    internal static byte[] BuildRtnTrade(int instance, string userId, string brokerId, string instrumentId, string orderRef, string tradeId, char direction, char offsetFlag, double price, int volume, string tradingDay) =>
         Apply(RtnTradeTemplate,
             new Edit(9, 2, InstanceField(instance)),
             new Edit(52, 12, F(orderRef, 12)),
             new Edit(76, 4, F(tradeId, 4)),
+            new Edit(119, 1, A(offsetFlag.ToString())),
+            new Edit(82, 1, A(direction.ToString())),
             new Edit(121, 3, PriceSlot(price)),
             new Edit(125, 1, MinimalInt(volume)),
             new Edit(33, 6, F(userId, 6)),
