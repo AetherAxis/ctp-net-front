@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ctp-net-front</AssemblyName>
+    <RootNamespace>ctp-net-front</RootNamespace>
+  </PropertyGroup>
+  <!-- CTP 前置协议适配层：线协议编解码 + RPC 客户端连交易所 + Sim 认证帧模板构建。
+       依赖 ctp-net-contracts（CTP 协议 DTO）+ Aether.Exchange.Rpc（RPC client/wire）。 -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\aether-exchange\src\Aether.Exchange.Rpc\Aether.Exchange.Rpc.csproj" />
+    <ProjectReference Include="..\..\..\ctp-net-contracts\src\Ctp.Net.Contracts\Ctp.Net.Contracts.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="ctp-net-front.Tests" />
+  </ItemGroup>
+</Project>
