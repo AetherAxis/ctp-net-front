@@ -99,6 +99,7 @@ public static class CtpDomainMapper
                 CtpTimeCondition.GFD => Aether.Exchange.TimeCondition.GFD,
                 CtpTimeCondition.IOC => Aether.Exchange.TimeCondition.IOC,
                 CtpTimeCondition.FOK => Aether.Exchange.TimeCondition.FOK,
+                CtpTimeCondition.PostOnly => Aether.Exchange.TimeCondition.PostOnly,
                 _ => Aether.Exchange.TimeCondition.GFD,
             },
             ClientOrderRef = c.OrderRef,
@@ -108,8 +109,10 @@ public static class CtpDomainMapper
         => new(c.BrokerId, c.InvestorId, c.FrontId, c.SessionId, c.OrderRef, c.ExchangeId);
 
     public static Aether.Exchange.ExchangeBusinessException ToDomainException(CtpBusinessException ex)
-        => new(ex.ErrorId, ex.Message);
+        => new(ex.ErrorId, ex.ErrorMsg);
 
     public static CtpBusinessException ToCtpException(Aether.Exchange.ExchangeBusinessException ex)
-        => new(ex.ErrorId, ex.Message);
+        // ErrorMsg = 原始业务消息；ex.Message 是「交易所业务错误 [id]: …」包装形态——
+        // 透传它会让 wire 错误消息双重前缀（2026-10-23 测试迁移逮住）。
+        => new(ex.ErrorId, ex.ErrorMsg);
 }

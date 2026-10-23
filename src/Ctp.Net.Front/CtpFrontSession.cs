@@ -213,6 +213,17 @@ internal sealed class CtpFrontSession : IDisposable
     private static (int Id, string Msg) WireError(CtpBusinessException ex)
         => ex.ErrorId > byte.MaxValue ? (148, $"[{ex.ErrorId}] {ex.ErrorMsg}") : (ex.ErrorId, ex.ErrorMsg);
 
+    /// <summary>RPC 拒单异常归一：分仓后 SimRpcClient（Exchange.Rpc）抛 <c>ExchangeBusinessException</c>，
+    /// 本类错误应答路径统一按 <c>CtpBusinessException</c> 消费（2026-10-23 测试迁移逮住的漏接：⑲/㉑ 只接
+    /// CtpBusinessException ⇒ post-only 拒单异常逃逸打死会话泵，后续 op 全部超时）。</summary>
+    private static CtpBusinessException AsCtp(Exception ex)
+        => ex switch
+        {
+            CtpBusinessException c => c,
+            Aether.Exchange.ExchangeBusinessException e => CtpDomainMapper.ToCtpException(e),
+            _ => throw ex,
+        };
+
     // —— M2 推送：RPC 推送事件 → OnRtnOrder/OnRtnTrade wire 帧（按连接路由——本连接只收本账户的推送，无需过滤）——
 
     private void OnRpcOrderPushed(Aether.Exchange.Order order)
@@ -561,12 +572,13 @@ internal sealed class CtpFrontSession : IDisposable
                 }), ct);
                 return null;   // 无应答帧——推送走捕获缓冲（DispatchFrameAsync 的 10ms 让路护客户端 tracker 注册）
             }
-            catch (CtpBusinessException ex)
+            catch (Exception ex) when (ex is CtpBusinessException or Aether.Exchange.ExchangeBusinessException)
             {
-                _log($"[CTP-Front] 报单拒绝: [{ex.ErrorId}] {ex.ErrorMsg}");
+                var cex = AsCtp(ex);
+                _log($"[CTP-Front] 报单拒绝: [{cex.ErrorId}] {cex.ErrorMsg}");
                 var inst = NextCmdInstance();
                 var echo = (_userId, _brokerId, o.InstrumentId, o.OrderRef, o.PriceType, o.Direction, o.OffsetFlag, o.LimitPrice, o.Volume, o.TimeCondition);
-                var (wireId, wireMsg) = WireError(ex);
+                var (wireId, wireMsg) = WireError(cex);
                 var rsp = BuildFrame(CtpFrontTemplates.BuildOrderInsertRspErr(inst, o.ReqId, wireId, wireMsg,
                     echo.Item1, echo.Item2, echo.Item3, echo.Item4, echo.Item5, echo.Item6, echo.Item7, echo.Item8, echo.Item9, echo.Item10));
                 var rtn = BuildFrame(CtpFrontTemplates.BuildErrRtnOrderInsert(NextRtnInstance(), wireId, wireMsg,
@@ -594,11 +606,12 @@ internal sealed class CtpFrontSession : IDisposable
                 await _rpc.CancelOrderAsync(CtpDomainMapper.ToDomainCancelKey(new CtpOrderRef(_brokerId, _userId, 0, 0, a.OrderRef, "")), ct);
                 return BuildFrame(CtpFrontTemplates.BuildOrderActionRspOk(inst, a.ReqId, _userId, _brokerId, a.OrderRef));
             }
-            catch (CtpBusinessException ex)
+            catch (Exception ex) when (ex is CtpBusinessException or Aether.Exchange.ExchangeBusinessException)
             {
-                _log($"[CTP-Front] 撤单拒绝: [{ex.ErrorId}] {ex.ErrorMsg}");
-                var rsp = BuildFrame(CtpFrontTemplates.BuildOrderActionRspErr(inst, a.ReqId, WireError(ex).Id, WireError(ex).Msg, _userId, _brokerId, a.OrderRef));
-                var rtn = BuildFrame(CtpFrontTemplates.BuildErrRtnOrderAction(NextRtnInstance(), WireError(ex).Id, WireError(ex).Msg, _userId, _brokerId, a.OrderRef));
+                var cex = AsCtp(ex);
+                _log($"[CTP-Front] 撤单拒绝: [{cex.ErrorId}] {cex.ErrorMsg}");
+                var rsp = BuildFrame(CtpFrontTemplates.BuildOrderActionRspErr(inst, a.ReqId, WireError(cex).Id, WireError(cex).Msg, _userId, _brokerId, a.OrderRef));
+                var rtn = BuildFrame(CtpFrontTemplates.BuildErrRtnOrderAction(NextRtnInstance(), WireError(cex).Id, WireError(cex).Msg, _userId, _brokerId, a.OrderRef));
                 var both = new byte[rsp.Length + rtn.Length];
                 rsp.CopyTo(both, 0); rtn.CopyTo(both, rsp.Length);
                 return both;

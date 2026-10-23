@@ -96,7 +96,7 @@ public sealed class RemoteCtpSession : ICtpSession, IDisposable
         }
         catch (ExchangeBusinessException ex)
         {
-            throw new CtpBusinessException(ex.ErrorId, ex.Message);
+            throw new CtpBusinessException(ex.ErrorId, ex.ErrorMsg);
         }
 
         var ctpResult = CtpDomainMapper.ToCtpLoginResult(result);
@@ -163,9 +163,17 @@ public sealed class RemoteCtpSession : ICtpSession, IDisposable
 
     // —— ICtpSession：下单 / 撤单 ——
 
-    public async Task<CtpOrderInsertResult> OrderInsertAsync(CtpOrderRequest request, CancellationToken ct = default)
+    /// <summary>下单（fire-and-forget 语义）。**方法体刻意非 async**：「未登录」守卫须在 Task 返回
+    /// 之前**本地同步抛**（ICtpSession 契约①——消费方 Assert.Throws / VM / AI 工具依赖同步语义；
+    /// 拆分后一度改为 async ⇒ 守卫异常被状态机捕获进 Task、契约破坏——2026-10-23 测试迁移逮住）。</summary>
+    public Task<CtpOrderInsertResult> OrderInsertAsync(CtpOrderRequest request, CancellationToken ct = default)
     {
         EnsureLoggedIn();
+        return InsertOrderCoreAsync(request, ct);
+    }
+
+    private async Task<CtpOrderInsertResult> InsertOrderCoreAsync(CtpOrderRequest request, CancellationToken ct)
+    {
         var domainReq = CtpDomainMapper.ToDomainOrderRequest(request);
         try
         {
@@ -174,13 +182,20 @@ public sealed class RemoteCtpSession : ICtpSession, IDisposable
         }
         catch (ExchangeBusinessException ex)
         {
-            throw new CtpBusinessException(ex.ErrorId, ex.Message);
+            throw new CtpBusinessException(ex.ErrorId, ex.ErrorMsg);
         }
     }
 
-    public async Task OrderActionAsync(CtpOrderRef orderRef, CancellationToken ct = default)
+    /// <summary>撤单：定位不到/已终态由服务端抛 <see cref="CtpBusinessException"/>（await 时到达）。
+    /// 同 <see cref="OrderInsertAsync"/>：非 async 外壳保证未登录守卫同步抛。</summary>
+    public Task OrderActionAsync(CtpOrderRef orderRef, CancellationToken ct = default)
     {
         EnsureLoggedIn();
+        return OrderActionCoreAsync(orderRef, ct);
+    }
+
+    private async Task OrderActionCoreAsync(CtpOrderRef orderRef, CancellationToken ct)
+    {
         var cancelKey = CtpDomainMapper.ToDomainCancelKey(orderRef);
         try
         {
@@ -188,7 +203,7 @@ public sealed class RemoteCtpSession : ICtpSession, IDisposable
         }
         catch (ExchangeBusinessException ex)
         {
-            throw new CtpBusinessException(ex.ErrorId, ex.Message);
+            throw new CtpBusinessException(ex.ErrorId, ex.ErrorMsg);
         }
     }
 
@@ -219,7 +234,7 @@ public sealed class RemoteCtpSession : ICtpSession, IDisposable
     private static async Task<T2> MapAsync<T1, T2>(Task<T1> task, Func<T1, T2> mapper)
     {
         try { return mapper(await task.ConfigureAwait(false)); }
-        catch (ExchangeBusinessException ex) { throw new CtpBusinessException(ex.ErrorId, ex.Message); }
+        catch (ExchangeBusinessException ex) { throw new CtpBusinessException(ex.ErrorId, ex.ErrorMsg); }
     }
 
     private void Enqueue(Callback cb) => _pump.Writer.TryWrite(cb);
