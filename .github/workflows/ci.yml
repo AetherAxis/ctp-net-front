@@ -27,6 +27,11 @@ jobs:
         with:
           repository: AetherAxis/aether-exchange
           path: aether-exchange
+      # 测试项目引用 ctp-net-core（E2E「SDK 即裁判」的官方 SDK wrapper）
+      - uses: actions/checkout@v4
+        with:
+          repository: AetherAxis/ctp-net-core
+          path: ctp-net-core
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
@@ -44,4 +49,12 @@ jobs:
 
       - name: Build
         run: dotnet build Ctp.Net.Front.slnx -c Release
+        working-directory: ctp-net-front
+
+      # 只跑纯 wire 格式钉子（OrderCodecShape/RtnOrderWidthShape——零 native P/Invoke）。
+      # E2E（CtpTrader/CtpMarketData 走官方 C++ SDK）暂留本地/开发机：Core 的 build/native
+      # 尚无 linux-x64 .so（MIGRATION.md §9.2 原生依赖统一交付的已知缺口）——补齐后在 CI 放开全量。
+      - name: Test (wire-format pins)
+        run: dotnet test Ctp.Net.Front.slnx -c Release --no-build
+          --filter "FullyQualifiedName~OrderCodecShapeTests|FullyQualifiedName~RtnOrderWidthShapeTests"
         working-directory: ctp-net-front

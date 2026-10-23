@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="src/Ctp.Net.Front/Ctp.Net.Front.csproj" />
+  <Project Path="tests/Ctp.Net.Front.Tests/Ctp.Net.Front.Tests.csproj" />
 </Solution>

@@ -13,6 +13,15 @@ CTP 线协议前置服务器（券商侧接入层）——官方 CTP SDK 会话�
 | `CtpFrontTemplates.cs` | SDK 模板结构（由 ProtoCapture 生成器从 CTP 头文件生成） |
 | `RemoteCtpSession.cs` | 交易所侧会话端口适配（实现 Ctp.Net.ICtpSession 的远端半边） |
 
+## 构建与测试
+
+```bash
+dotnet test Ctp.Net.Front.slnx    # E2E 需 macOS frameworks（csproj CopyCtpMacFrameworks 自动复制）
+```
+
+- `tests/Ctp.Net.Front.Tests`：E2E（官方 SDK 即裁判：CtpTrader/CtpMarketData 走真实回环）+ wire 格式钉子（帧宽/编解码形状）+ `SessionAdapterTests`（RemoteCtpSession 的 ICtpSession 契约——自 monorepo Simulator 测试迁入）。
+- CI 只跑纯 wire 格式钉子（零 native P/Invoke）——E2E 暂留本地：Core 的 `build/native` 尚无 linux-x64 `.so`（原生依赖统一交付的已知缺口，见工作区 MIGRATION.md §9.2）。
+
 ## 拓扑
 
 ```
