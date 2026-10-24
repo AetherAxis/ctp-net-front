@@ -521,15 +521,27 @@ internal sealed class CtpFrontSession : IDisposable
         }
 
         // 查成交请求: E1 04 E2 80 02（真前置 2026-10-24 实抓：请求 op=02、应答 op=03，reqId 在 E1 01 E1 CD E3 后）。
-        // 本前置恒回空表（13B tag 帧）：交易所侧成交查询未接入（非空记录帧未逆向），但**必须应答**——
-        // 不回会让标准客户端的查询管线白等 30s。空表与真前置同形逐字节一致。
+        // **必须应答**——不回会让标准客户端的查询管线白等 30s。0 笔 = 13B 空表 tag 帧（与真前置同形逐字节）；
+        // 非空 = 每笔成交一帧 tag 记录帧（⑲ 284B 模板，2026-10-24 用真前置实成交样本逆向完成）。
         if (MatchesSignature(body, "E104E28002"))
         {
             var tradeReqId = ExtractReqIdAfter(body, "E101E1CDE3");
-            _log($"[CTP-Front] 查成交 reqId={tradeReqId} → 13B payload tag 空表（真前置同款形状）");
-            return tradeReqId is { } tid
-                ? BuildFrame(CtpFrontTemplates.BuildQryTradeEmptyRsp(NextQrySeq(), tid))
-                : null;
+            var trades = await _rpc.QueryTradesAsync(null, ct);
+            if (tradeReqId is not { } tid) return null;
+            if (trades.Count == 0)
+            {
+                _log($"[CTP-Front] 查成交 reqId={tid} → 0 笔 → 13B payload tag 空表");
+                return BuildFrame(CtpFrontTemplates.BuildQryTradeEmptyRsp(NextQrySeq(), tid));
+            }
+            _log($"[CTP-Front] 查成交 reqId={tid} → {trades.Count} 笔，逐笔一帧");
+            var tradeFrames = trades.Select(t => BuildFrame(CtpFrontTemplates.BuildQryTradeRsp(
+                NextQrySeq(), tid, _brokerId, _userId, t.InstrumentId, t.ExchangeId, t.OrderRef, t.TradeId,
+                (char)t.Direction, (char)t.OffsetFlag, t.Price, t.Volume,
+                string.IsNullOrEmpty(t.TradeDate) ? day : t.TradeDate, t.TradeTime, day))).ToArray();
+            var tradeBuf = new byte[tradeFrames.Sum(b => b.Length)];
+            var tradeOff = 0;
+            foreach (var b in tradeFrames) { b.CopyTo(tradeBuf, tradeOff); tradeOff += b.Length; }
+            return tradeBuf;
         }
 
         // 查报单请求: E1 04 E2 80 E4 <计数器>（⑤⑦ 族同款——计数在 op 字节不在 E3）；reqId 在 E1 01 E1 CD E3 后。

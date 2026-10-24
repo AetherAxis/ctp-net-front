@@ -419,6 +419,74 @@ internal static class CtpFrontTemplates
             new Edit(12, 1, EscapedValue(reqId))
         );
 
+    // ===== 帧 ⑲ 查成交应答·非空单行（284B payload——2026-10-24 真前置实抓：账户 1 笔 m2701 成交
+    // 1@3279 TradeID=2344。真前置 0 行回 13B 空表、≥2 行走列式二进制；本前置恒用本 tag 记录帧逐行。
+    // 槽位按 CTP TThostFtdcTradeField 的字段序解码并与探针实证互证：流水@9 / reqId 值@17 / Broker@23,41,97,168 /
+    // Exchange@28,73,198 / Investor@34,66 / UserID@66 / Instrument@46,113,192,202,208,273 / OrderRef@53 /
+    // TradeID@77 / Direction@83 / OffsetFlag@120 / HedgeFlag@121 / Price@122(3B PriceSlot) / Volume@126 /
+    // TradeDate@127 / TradeTime@136 / TradingDay@176。
+    // 偏移是本帧固定值：与报单帧不同构（报单 reqId 值在 @16，本帧 @16 是 E3 标签）——照抄报单帧的偏移
+    // 会让整帧被 SDK 丢弃（30s 超时）。
+    // 抓包原始账号/会话已换中性等宽值（用户号→`000000`、成交号→`0000`、复合号→`9999000000`）。=====
+    internal static readonly byte[] QryTradeRspTemplate = H(
+        "0103344CE104E28003E319E10101E0EFE308040901E0EB39393939E1444345E139E1303030303030E139393939E26D323730" +
+        "31EFEB303030303030303030303032E1303030303030EA444345E630303030EFE230202020202020203133333132E9393939" +
+        "39E739393939303030303030E26D32373031EFEB303140A99EE8013230323631303232E132303A30393A3338E130E1393939" +
+        "39616263EE202020202020202020363930E139393939EFEF03C23230323631303233E401E294D530EFE26D32373031E14443" +
+        "45E16D32373031E16D32373031E16DE131E132303237E131E131303030E131E131303030E131E13130E131E1323032363031" +
+        "3139E13230323630313139E13230323730313135E132E16D32373031EFEFEFEFEFE1"
+    );
+
+    /// <summary>成交号槽宽（探针实证：本记录帧内任何槽**改宽即整帧被 SDK 丢弃**——与 ⑯ 的状态消息槽同款纪律）。</summary>
+    private const int QryTradeIdWidth = 4;
+
+    /// <summary>成交号定宽填充（左补零；超宽截尾——同日内超过 10^(宽度) 笔会撞号，如实标注）。</summary>
+    private static byte[] TradeIdSlot(string tradeId)
+    {
+        var v = tradeId.Length == 0 ? "0" : tradeId;
+        return A(v.Length >= QryTradeIdWidth ? v[^QryTradeIdWidth..] : v.PadLeft(QryTradeIdWidth, '0'));
+    }
+
+    /// <summary>
+    /// ⑲ 查成交应答·非空单行（真前置 tag 记录帧）。与 ⑯ 查报单记录帧同一族（同一 tag 语法、同一套等宽纪律）。
+    /// <para>
+    /// <b>成交号必须定宽</b>：2026-10-24 E2E 实测——1 位成交号写成 4 位槽的 1 字节后，整帧被 SDK 静默丢弃
+    /// （查询 0 行、`isLast=true`，与 ⑯ 状态消息槽变宽的表现一致）。故走 <see cref="TradeIdSlot"/> 定宽左补零。
+    /// </para>
+    /// </summary>
+    internal static byte[] BuildQryTradeRsp(int instance, byte reqId, string brokerId, string investorId,
+        string instrumentId, string exchangeId, string orderRef, string tradeId,
+        char direction, char offsetFlag, double price, int volume,
+        string tradeDate, string tradeTime, string tradingDay) =>
+        Apply(QryTradeRspTemplate,
+            new Edit(9, 2, InstanceField(instance)),
+            new Edit(17, 1, EscapedValue(reqId)),   // 本帧 @16 是 E3 标签本身，值在 @17（报单帧 @16 即值——两帧不一致）
+            new Edit(23, 4, F(brokerId, 4)),
+            new Edit(28, 3, F(exchangeId, 3)),
+            new Edit(34, 6, F(investorId, 6)),
+            new Edit(41, 4, F(brokerId, 4)),
+            new Edit(46, 5, F(instrumentId, 5)),
+            new Edit(53, 12, F(orderRef, 12)),
+            new Edit(66, 6, F(investorId, 6)),
+            new Edit(73, 3, F(exchangeId, 3)),
+            new Edit(77, 4, TradeIdSlot(tradeId)),
+            new Edit(83, 1, [(byte)direction]),
+            new Edit(97, 4, F(brokerId, 4)),
+            new Edit(113, 5, F(instrumentId, 5)),
+            new Edit(120, 1, [(byte)offsetFlag]),
+            new Edit(122, 3, PriceSlot(price)),
+            new Edit(126, 1, MinimalInt(volume)),
+            new Edit(127, 8, F(tradeDate, 8)),
+            new Edit(136, 8, F(tradeTime, 8)),
+            new Edit(168, 4, F(brokerId, 4)),
+            new Edit(176, 8, F(tradingDay, 8)),
+            new Edit(192, 5, F(instrumentId, 5)),
+            new Edit(198, 3, F(exchangeId, 3)),
+            new Edit(202, 5, F(instrumentId, 5)),
+            new Edit(208, 5, F(instrumentId, 5)),
+            new Edit(273, 5, F(instrumentId, 5))
+        );
+
     // ===== 帧 ⑯ 查报单应答·非空单行（442B payload——2026-10-24 真前置实抓：账户 1 张已撤 m2705 报单。
     // 真前置按行数选格式：1 行 → 本 tag 记录帧；≥2 行 → 列式二进制（不逆向）。多行 = 本帧重复（与持仓同路径：
     // tag 帧恒 isLast=true，多行靠 wrapper 静默期收尾）。记录区字段经逐字节打补丁探针定位（改哪个字节
