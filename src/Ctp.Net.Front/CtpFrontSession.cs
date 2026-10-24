@@ -50,9 +50,9 @@ internal sealed class CtpFrontSession : IDisposable
     private State _state = State.WaitingHandshake;
     private readonly CtpFrameParser _parser = new();
 
-    // 查报单缺口告警节流（2026-10-24——多行报单应答帧未实现，见 WarnIfOrdersExistAsync）
-    private DateTime _lastOrderGapWarnAt = DateTime.MinValue;
-    private int _orderGapWarnCount;
+    /// <summary>查报单一次应答最多回多少行（账本保留全部历史，bot 账户可达上万条——一条一帧会洪水）。
+    /// 真前置只回当日委托；本地账本没有日期维度，用「活单优先 + 封顶」近似，超出部分不回（日志标注）。</summary>
+    private const int QueryOrderRowCap = 200;
 
     // 会话身份（⑤/⑦ 请求中提取）
     private string _userId = "";
@@ -213,42 +213,6 @@ internal sealed class CtpFrontSession : IDisposable
     private int _cmdInstanceInt;
     private int NextCmdInstance() => ++_cmdInstanceInt;
 
-    /// <summary>
-    /// 查报单的诚实告警（2026-10-24）：本前置**没有非空报单的应答帧模板**——真前置的非空报单走 LZ4 列式二进制
-    /// （未逆向；已对齐的只有空表那个 13B tag 帧），所以任何查报单都回空表。账户真有活单时，客户端看到的
-    /// 「委托表为空」是假象：这里按 30s 节流把它写进日志，不让缺口静默（这是已知功能缺失，不是真前置行为）。
-    /// </summary>
-    /// <summary>
-    /// 查报单缺口告警：本前置没有非空报单应答帧模板，查报单一律回空表。账户真有委托时这不只是「少几行」——
-    /// 客户端会据此认为自己没有可撤的活单（对账/追单逻辑直接走错分支），所以必须喊进日志。
-    /// <para>
-    /// 计数口径：<c>QueryOrders</c> 回的是账户账本里的<b>全部</b>委托（含已成/已撤的历史记录，实测 botmm 单账户
-    /// 上万条），所以分开报——活单（'3' 未成交在队列 / '1' 部分成交在队列，即 <c>SimOrderStatus.IsLive</c>）
-    /// 是危险量，历史条数只是背景。
-    /// </para>
-    /// </summary>
-    private void WarnIfOrdersExistAsync()
-    {
-        if ((DateTime.UtcNow - _lastOrderGapWarnAt).TotalSeconds < 30) return;
-        _lastOrderGapWarnAt = DateTime.UtcNow;
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var orders = await _rpc.QueryOrdersAsync(null, CancellationToken.None);
-                if (orders.Count == 0) return;
-                var live = 0;
-                foreach (var o in orders)
-                    if ((char)o.OrderStatusRaw is '3' or '1') live++;
-                _log($"[CTP-Front] ⚠ 查报单：账本共 {orders.Count} 条委托记录（其中活单 {live} 张），" +
-                     $"但非空报单应答帧未实现——本次仍回空表" +
-                     (live > 0 ? $"（客户端看到空委托表是假象，实际有 {live} 张可撤活单）" : "（只有历史记录，客户端仍应看到当日委托）") +
-                     $"；第 {++_orderGapWarnCount} 次告警");
-            }
-            catch { /* 告警失败不影响查询本身 */ }
-        });
-    }
-
     /// <summary>核心错误码 → wire 错误码（捕获槽 1 字节：>255 的核心码降级为 148 通用码，真码进 GBK 文本前缀）。</summary>
     private static (int Id, string Msg) WireError(CtpBusinessException ex)
         => ex.ErrorId > byte.MaxValue ? (148, $"[{ex.ErrorId}] {ex.ErrorMsg}") : (ex.ErrorId, ex.ErrorMsg);
@@ -296,6 +260,22 @@ internal sealed class CtpFrontSession : IDisposable
         '5' => "已撤销",
         _ => order.StatusMsg is { Length: > 0 } ? order.StatusMsg : "终态",
     };
+
+    /// <summary>
+    /// 查报单行的状态消息（⑯ 记录帧的消息槽是 `EB` + GBK 转义 run，<b>可变长</b>——真前置两份抓包 442B/488B
+    /// 的差值恰是消息长度差，故此处不必按推送的 6B 槽截断）。账本没给消息时按状态补中文短语。
+    /// </summary>
+    private static string OrderStatusMsg(Aether.Exchange.Order o) =>
+        o.StatusMsg is { Length: > 0 } ? o.StatusMsg : (char)o.OrderStatusRaw switch
+        {
+            '0' => "全部成交",
+            '1' => "部分成交",
+            '2' => "部分成交已作废",
+            '3' => "未成交",
+            '4' => "未成交已作废",
+            '5' => "已撤销",
+            _ => "",
+        };
 
     private void OnRpcTradePushed(Aether.Exchange.Trade trade)
     {
@@ -553,21 +533,43 @@ internal sealed class CtpFrontSession : IDisposable
         }
 
         // 查报单请求: E1 04 E2 80 E4 <计数器>（⑤⑦ 族同款——计数在 op 字节不在 E3）；reqId 在 E1 01 E1 CD E3 后。
-        // **必须应答**（恒空表——2026-10-03 双 bot 实测：未应答的查报单把客户端查询管线堵死 30s，
+        // **必须应答**（2026-10-03 双 bot 实测：未应答的查报单把客户端查询管线堵死 30s，
         // Lean 引擎 GetCashBalance 排队超时 → cash=0 → 引擎侧 buying power 拒掉全部订单）。
-        // 真前置多行报单走 LZ4 二进制（不逆向）；空表（17B tag 帧）为 SimNow 过滤查询实抓模板，
-        // E3 = 应答侧 80 族记录流水（NextQrySeq——二进制 6 行内部消耗 6 个号、空应答接续）。
-        // <b>这是已知功能缺失</b>：标准 CTP 客户端的报单查询是「逐条回调 + bIsLast 收尾」
-        // （官方 ThostFtdcTraderApi.h 的 OnRspQryOrder），有委托就该有行；本前置没有非空报单的帧模板，
-        // 只能回空表 —— 账户真有活单时由 WarnIfOrdersExistAsync 喊进日志（2026-10-24）。
+        // 空表 = 17B tag 帧（真前置实抓逐字节）。非空 = 每张委托一帧 tag 记录帧（⑯ 模板，2026-10-24 逆向完成）：
+        // 真前置 1 行回该 tag 帧、≥2 行走列式二进制；本前置恒用 tag 帧逐行（与持仓同款，多行靠 wrapper 静默期收尾）。
         if (MatchesSignature(body, "E104E280E4"))
         {
             var reqId = ExtractReqIdAfter(body, "E101E1CDE3");
-            WarnIfOrdersExistAsync();   // 有活单却回空表 ⇒ 必须喊出来（见方法注释）
-            _log($"[CTP-Front] 查报单 reqId={reqId} → 13B payload tag 空表（17B 线上；2026-10-24 真前置实抓逐字节一致，SDK 30s 超时后管线恢复——真前置同款行为）");
-            return reqId is { } id
-                ? BuildFrame(CtpFrontTemplates.BuildQryOrderEmptyRsp(NextQrySeq(), id))
-                : null;
+            // 两个回显槽都取自请求（跨 await 前先取值——body 是 span）：reqId 在 E3 后；
+            // 计数器 = 请求 op 字节之后那个字节（2026-10-24 配对抓包 + 回放探针实证：记录帧该槽
+            // 必须等于请求值，写前置自己的序列号会被 SDK 丢弃 ⇒ 查询 30s 超时）。
+            var counter = body.Length > 5 ? body[5] : (byte)NextQrySeq();
+            var orders = await _rpc.QueryOrdersAsync(null, ct);
+            if (reqId is not { } id) return null;
+            if (orders.Count == 0)
+            {
+                _log($"[CTP-Front] 查报单 reqId={id} → 0 条 → 13B payload tag 空表");
+                return BuildFrame(CtpFrontTemplates.BuildQryOrderEmptyRsp(NextQrySeq(), id));
+            }
+            // 账本保留全部历史（bot 账户可达上万条），一条一帧会洪水——活单优先、总量封顶（真前置只回当日委托）。
+            var picked = orders.Where(o => (char)o.OrderStatusRaw is '1' or '3').Take(QueryOrderRowCap).ToList();
+            if (picked.Count < QueryOrderRowCap)
+            {
+                var room = QueryOrderRowCap - picked.Count;
+                picked.AddRange(orders.Where(o => (char)o.OrderStatusRaw is not ('1' or '3')).Take(room));
+            }
+            _log($"[CTP-Front] 查报单 reqId={id} → 账本 {orders.Count} 条，回 {picked.Count} 行" +
+                 (picked.Count < orders.Count ? $"（活单优先 + 封顶 {QueryOrderRowCap}，其余不回）" : ""));
+            // 多行序号：首行回显请求计数器，其后逐一递增（持仓族同款「每行一个序号」——2026-10-24 实测同号
+            // 的两行只到一行）。
+            var frames = picked.Select((o, i) => BuildFrame(CtpFrontTemplates.BuildQryOrderRsp(
+                counter + i, id, _brokerId, _userId, o.InstrumentId, o.ExchangeId, o.OrderRef,
+                (char)o.PriceType, (char)o.Direction, (char)o.OffsetFlag, o.LimitPrice, o.VolumeTotalOriginal,
+                '3', (char)o.OrderStatusRaw, OrderStatusMsg(o), day, o.InsertTime))).ToArray();
+            var buf = new byte[frames.Sum(b => b.Length)];
+            var off = 0;
+            foreach (var b in frames) { b.CopyTo(buf, off); off += b.Length; }
+            return buf;
         }
 
         // 终端信息上报: E4 30 E6 05 01 31（SDK 每次登录自动发、真前置不应答——2026-10-03 录制实证）。

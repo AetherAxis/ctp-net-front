@@ -419,6 +419,69 @@ internal static class CtpFrontTemplates
             new Edit(12, 1, EscapedValue(reqId))
         );
 
+    // ===== 帧 ⑯ 查报单应答·非空单行（442B payload——2026-10-24 真前置实抓：账户 1 张已撤 m2705 报单。
+    // 真前置按行数选格式：1 行 → 本 tag 记录帧；≥2 行 → 列式二进制（不逆向）。多行 = 本帧重复（与持仓同路径：
+    // tag 帧恒 isLast=true，多行靠 wrapper 静默期收尾）。记录区字段经逐字节打补丁探针定位（改哪个字节
+    // 客户端哪个字段跟着变），可比对推送族 OnRtnOrder（同一记录 schema，整体 +1 偏移）。
+    // 抓包原始账号/会话/IP 已换成中性等宽值（用户号→`000000`、IP→`192.168.000.001`、会话号→11223344）；
+    // 运行期再由 Build 覆盖 broker/user/流水/合约/价量/时间等字段——字节宽度与抓包完全一致。=====
+    internal static readonly byte[] QryOrderRspTemplate = H(
+        "0103344CE104E28001E301E1010353E3040401034F39393939E7303030303030E76D32373035EFEB30303030303030303030" +
+        "3032E1303030303030EA323130E431E440AA90E80133E931E30131E830E439393939616263E139393939E131E131E1393939" +
+        "E5202020202020202020323837E1444345E16D323730E139393939E131E3C9E139393939303030303030E16D32373035EFEB" +
+        "39393939616263E139393939E131E131E1393939E40134E3013230323631303233E401E14F52443A3030303030303030E830" +
+        "3530E7013230323631303234E131373A32333A3439EFEFEFEFEFE10111223344EB34393AD2D1B3B7B5A5B1A8B5A5B1BBBEDC" +
+        "BEF84443453ABCDBB8F1B3ACB3F6D5C7CDA3B0E0E5EFEFEFE444ABE0E3977FE2F0509503E64AA9E17FE2C0CBCBF9997FE2F0" +
+        "509503EE7FE22044ABE0E3EFEFE53139322E3136382E3030302E303031EFE76D32373035EFEFEFEFEFE16D32373035E16DE1" +
+        "31E132303237E135E131303030E131E131303030E131E13130E131E13230323630353230E13230323630353230E132303237" +
+        "30353139E13230323730353139E13230323730353234E13139322E3136382E3030302E303031EFEFE401"
+    );
+
+    /// <summary>⑯ 查报单记录帧的状态消息槽宽（GBK 转义后字节数——抓包槽宽，定宽纪律：改宽整帧被 SDK 丢弃）。</summary>
+    private const int QryOrderMsgWidth = 38;
+
+    /// <summary>
+    /// ⑯ 查报单应答·非空单行（真前置 tag 记录帧）。字段槽位由逐字节探针定死（2026-10-24）：
+    /// 流水 @40(12)、方向三元组 @60(3)、价格 @66(3 = <see cref="PriceSlot"/>)、量+TimeCondition @70(2 = <see cref="VolumeEdit"/>)、
+    /// 交易所 @114(3)、合约 @331(5 及 33/118/143/342 四个冗余副本)、状态下标 <paramref name="orderStatus"/> @200、
+    /// 报单时间 @213(8)、交易日 @175 / 报单日期 @204、状态消息 @232（`EB` + GBK 转义 run，<b>定宽 38B</b>——
+    /// 2026-10-24 探针实证：消息槽改等宽可解、改变长则整帧被 SDK 丢弃 ⇒ 超长按 GBK 字节截断、不足补空格）。
+    /// <para>
+    /// 已知边界（如实标注，不静默）：<c>VolumeTraded</c>/<c>VolumeTotal</c> 的槽位落在消息之后的数值 run 里
+    /// （未逐字节定位），本帧沿用抓包值 0/1 —— 部分成交的报单在查报单里仍显示「成交 0 手」。成交回报推送
+    /// （OnRtnTrade）不受影响；客户端以推送收敛成交数，查询行只作对账底稿。
+    /// </para>
+    /// </summary>
+    internal static byte[] BuildQryOrderRsp(int instance, byte reqId, string brokerId, string investorId,
+        string instrumentId, string exchangeId, string orderRef, char priceType, char direction, char offsetFlag,
+        double limitPrice, int volume, char timeCondition, char orderStatus, string statusMsg,
+        string tradingDay, string insertTime) =>
+        Apply(QryOrderRspTemplate,
+            new Edit(9, 2, InstanceField(instance)),
+            new Edit(16, 1, EscapedValue(reqId)),
+            new Edit(21, 4, F(brokerId, 4)),
+            new Edit(26, 6, F(investorId, 6)),
+            new Edit(33, 5, F(instrumentId, 5)),
+            new Edit(40, 12, F(orderRef, 12)),
+            new Edit(53, 6, F(investorId, 6)),
+            new Edit(60, 3, A($"{priceType}{direction}{offsetFlag}")),
+            new Edit(66, 3, PriceSlot(limitPrice)),
+            VolumeEdit(70, volume, timeCondition),
+            new Edit(88, 4, F(brokerId, 4)),
+            new Edit(114, 3, F(exchangeId, 3)),
+            new Edit(118, 4, F(instrumentId, 4)),
+            new Edit(123, 4, F(brokerId, 4)),
+            new Edit(143, 5, F(instrumentId, 5)),
+            new Edit(158, 4, F(brokerId, 4)),
+            new Edit(331, 5, F(instrumentId, 5)),
+            new Edit(342, 5, F(instrumentId, 5)),
+            new Edit(175, 8, F(tradingDay, 8)),   // 定宽：空交易日也不许缩帧
+            new Edit(200, 1, [(byte)orderStatus]),
+            new Edit(204, 8, F(tradingDay, 8)),
+            new Edit(213, 8, F(insertTime, 8)),
+            new Edit(232, 39, Cat(H("EB"), EscapedGbkFixed(statusMsg.Length == 0 ? " " : statusMsg, QryOrderMsgWidth)))
+        );
+
     // ===== 查报单二进制应答（807B payload——2026-10-03 SimNow 实抓完整帧。
     // 路由 01 04 21 03 ≠ tag 路由 01 03 34 4C ≠ LZ4 路由 01 04 FA 0F——第三种格式（列式共享字段）。
     // 结构：路由(4B) + 固定头(12B) + 80族流水(4B BE @16) + 固定(4B) + reqId(4B BE @24) + 记录数据(779B)。
