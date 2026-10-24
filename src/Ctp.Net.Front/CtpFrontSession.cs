@@ -218,6 +218,15 @@ internal sealed class CtpFrontSession : IDisposable
     /// （未逆向；已对齐的只有空表那个 13B tag 帧），所以任何查报单都回空表。账户真有活单时，客户端看到的
     /// 「委托表为空」是假象：这里按 30s 节流把它写进日志，不让缺口静默（这是已知功能缺失，不是真前置行为）。
     /// </summary>
+    /// <summary>
+    /// 查报单缺口告警：本前置没有非空报单应答帧模板，查报单一律回空表。账户真有委托时这不只是「少几行」——
+    /// 客户端会据此认为自己没有可撤的活单（对账/追单逻辑直接走错分支），所以必须喊进日志。
+    /// <para>
+    /// 计数口径：<c>QueryOrders</c> 回的是账户账本里的<b>全部</b>委托（含已成/已撤的历史记录，实测 botmm 单账户
+    /// 上万条），所以分开报——活单（'3' 未成交在队列 / '1' 部分成交在队列，即 <c>SimOrderStatus.IsLive</c>）
+    /// 是危险量，历史条数只是背景。
+    /// </para>
+    /// </summary>
     private void WarnIfOrdersExistAsync()
     {
         if ((DateTime.UtcNow - _lastOrderGapWarnAt).TotalSeconds < 30) return;
@@ -228,8 +237,13 @@ internal sealed class CtpFrontSession : IDisposable
             {
                 var orders = await _rpc.QueryOrdersAsync(null, CancellationToken.None);
                 if (orders.Count == 0) return;
-                _log($"[CTP-Front] ⚠ 查报单：账户有 {orders.Count} 张委托，但非空报单应答帧未实现——本次仍回空表" +
-                     $"（客户端看到空委托表是假象；第 {++_orderGapWarnCount} 次告警）");
+                var live = 0;
+                foreach (var o in orders)
+                    if ((char)o.OrderStatusRaw is '3' or '1') live++;
+                _log($"[CTP-Front] ⚠ 查报单：账本共 {orders.Count} 条委托记录（其中活单 {live} 张），" +
+                     $"但非空报单应答帧未实现——本次仍回空表" +
+                     (live > 0 ? $"（客户端看到空委托表是假象，实际有 {live} 张可撤活单）" : "（只有历史记录，客户端仍应看到当日委托）") +
+                     $"；第 {++_orderGapWarnCount} 次告警");
             }
             catch { /* 告警失败不影响查询本身 */ }
         });
