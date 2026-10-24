@@ -258,7 +258,7 @@ internal sealed class CtpFrontMdSession : IDisposable
         {
             // 快照通道的 MarketQuote 无成交量字段（⑥ RPC 契约）——订阅首帧先给 0，随后的流式 tick 带真实量。
             parts.Add(BuildFrame(CtpFrontTemplates.BuildMdTick(q.InstrumentId, snap.TradingDay,
-                snap.TimeOfDay, q.LastPrice, q.BidPrice, q.AskPrice, volume: 0)));
+                snap.TimeOfDay, q.LastPrice, q.BidPrice, q.AskPrice, volume: 0, bidVolume: 0, askVolume: 0)));
             _log($"→ 快照: {q.InstrumentId} last={q.LastPrice} bid={q.BidPrice} ask={q.AskPrice}");
         }
         var total = parts.Sum(b => b.Length);
@@ -277,7 +277,7 @@ internal sealed class CtpFrontMdSession : IDisposable
         // 重复推送快照帧触发 native 无限重投；E4F103 是真实 tick 流 op，481 帧/次会话 SDK 零洪水）
         RoutePush(BuildFrame(CtpFrontTemplates.BuildMdTick(tick.InstrumentId, day,
             string.IsNullOrEmpty(tick.UpdateTime) ? _timeOfDay : tick.UpdateTime,
-            tick.LastPrice, tick.BidPrice, tick.AskPrice, tick.Volume)));
+            tick.LastPrice, tick.BidPrice, tick.AskPrice, tick.Volume, tick.BidVolume, tick.AskVolume)));
     }
 
     // —— 工具（与交易腿同款规则）——

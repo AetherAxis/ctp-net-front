@@ -769,7 +769,7 @@ internal static class CtpFrontTemplates
     /// 实测；成交按 maker 价，ceil 无经济副作用），成交量槽 ← <paramref name="volume"/>（原为抓包常量
     /// `0C 3D CE` = 802254，客户端常年读到冻结量）。</summary>
     internal static byte[] BuildMdTick(string instrumentId, string tradingDay, string updateTime,
-        double lastPrice, double bidPrice, double askPrice, long volume) =>
+        double lastPrice, double bidPrice, double askPrice, long volume, int bidVolume, int askVolume) =>
         Apply(MdTickTemplate,
             new Edit(32, 8, A(tradingDay)),
             new Edit(16, 5, F(instrumentId, 5)),
@@ -778,11 +778,17 @@ internal static class CtpFrontTemplates
             new Edit(56, 3, PriceSlot(lastPrice)),
             new Edit(60, 3, FixedInt3(volume)),
             new Edit(82, 3, PriceSlot(bidPrice, 3, roundUp: false)),
-            new Edit(88, 3, PriceSlot(askPrice, 3, roundUp: true))
+            new Edit(86, 2, FixedInt2(bidVolume)),
+            new Edit(88, 3, PriceSlot(askPrice, 3, roundUp: true)),
+            new Edit(92, 2, FixedInt2(askVolume))
         );
 
-    /// <summary>3B 定宽大端整数（tick 量槽宽度与抓包一致——先验宽度不变，只改值）。
+    /// <summary>3B 定宽大端整数（总成交量槽——宽度与抓包一致，先验宽度不变，只改值）。
     /// 槽宽 3B 上限 16777215（真前置该槽抓包即 3B，日均量更大的合约会撑宽——未实测，
     /// 本地仿真量级远低于此）。</summary>
     internal static byte[] FixedInt3(long v) => [(byte)(v >> 16), (byte)(v >> 8), (byte)v];
+
+    /// <summary>2B 定宽大端整数（买一/卖一档量槽——抓包值 1105/808 与客户端解码值逐位吻合，
+    /// 见 <see cref="BuildMdTick"/>；上限 65535）。</summary>
+    internal static byte[] FixedInt2(int v) => [(byte)(v >> 8), (byte)v];
 }

@@ -91,5 +91,8 @@ public sealed class CtpFrontE2eM3Tests : IDisposable
         // 成交量真实化（2026-10-24）：模板量槽原为抓包常量 802254（客户端常年读到冻结量）；
         // 现在 ← 交易所 tick 的累计成交量——本场 1 手成交 ⇒ 1。
         Assert.Equal(1, tick.Volume);
+        // 买卖一档量同理（模板常量 1105/808 即两槽抓包值，offset 86-87 / 92-93）。
+        // 卖侧 20 手被吃 1 手 ⇒ 剩 19。
+        Assert.Equal(19, tick.AskVolume);
     }
 }
