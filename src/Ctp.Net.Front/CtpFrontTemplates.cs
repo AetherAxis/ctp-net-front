@@ -405,6 +405,20 @@ internal static class CtpFrontTemplates
             new Edit(12, 1, EscapedValue(reqId))
         );
 
+    /// <summary>
+    /// 查成交空应答（13B payload / 17B 线上——2026-10-24 真前置实抓逐字节：请求 op `E104E28002`、
+    /// 应答 op `E104E28003`，帧形与查报单空表同构：`0103344C E104E28003 E3 01 E7 04`）。
+    /// 账户当日无成交时真前置回此帧；SDK 随即以「空记录 + isLast=true」完成查询（0 行）。
+    /// </summary>
+    internal static readonly byte[] QryTradeEmptyRspTemplate = H("0103344CE104E28003E301E704");
+
+    /// <summary>查成交空应答（E3 值槽 = offset 10、E7 reqId 值槽 = offset 12——与查报单同槽位）。</summary>
+    internal static byte[] BuildQryTradeEmptyRsp(int e3Value, byte reqId) =>
+        Apply(QryTradeEmptyRspTemplate,
+            new Edit(9, 2, InstanceField(e3Value)),
+            new Edit(12, 1, EscapedValue(reqId))
+        );
+
     // ===== 查报单二进制应答（807B payload——2026-10-03 SimNow 实抓完整帧。
     // 路由 01 04 21 03 ≠ tag 路由 01 03 34 4C ≠ LZ4 路由 01 04 FA 0F——第三种格式（列式共享字段）。
     // 结构：路由(4B) + 固定头(12B) + 80族流水(4B BE @16) + 固定(4B) + reqId(4B BE @24) + 记录数据(779B)。

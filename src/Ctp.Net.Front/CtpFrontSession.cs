@@ -540,6 +540,18 @@ internal sealed class CtpFrontSession : IDisposable
             return buf;
         }
 
+        // 查成交请求: E1 04 E2 80 02（真前置 2026-10-24 实抓：请求 op=02、应答 op=03，reqId 在 E1 01 E1 CD E3 后）。
+        // 本前置恒回空表（13B tag 帧）：交易所侧成交查询未接入（非空记录帧未逆向），但**必须应答**——
+        // 不回会让标准客户端的查询管线白等 30s。空表与真前置同形逐字节一致。
+        if (MatchesSignature(body, "E104E28002"))
+        {
+            var tradeReqId = ExtractReqIdAfter(body, "E101E1CDE3");
+            _log($"[CTP-Front] 查成交 reqId={tradeReqId} → 13B payload tag 空表（真前置同款形状）");
+            return tradeReqId is { } tid
+                ? BuildFrame(CtpFrontTemplates.BuildQryTradeEmptyRsp(NextQrySeq(), tid))
+                : null;
+        }
+
         // 查报单请求: E1 04 E2 80 E4 <计数器>（⑤⑦ 族同款——计数在 op 字节不在 E3）；reqId 在 E1 01 E1 CD E3 后。
         // **必须应答**（恒空表——2026-10-03 双 bot 实测：未应答的查报单把客户端查询管线堵死 30s，
         // Lean 引擎 GetCashBalance 排队超时 → cash=0 → 引擎侧 buying power 拒掉全部订单）。
