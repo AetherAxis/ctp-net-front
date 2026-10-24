@@ -508,7 +508,7 @@ internal sealed class CtpFrontSession : IDisposable
         if (MatchesSignature(body, "E104E280E4"))
         {
             var reqId = ExtractReqIdAfter(body, "E101E1CDE3");
-            _log($"[CTP-Front] 查报单 reqId={reqId} → 17B tag 空表（SDK 30s 超时后管线恢复——真前置同款行为）");
+            _log($"[CTP-Front] 查报单 reqId={reqId} → 13B payload tag 空表（17B 线上；2026-10-24 真前置实抓逐字节一致，SDK 30s 超时后管线恢复——真前置同款行为）");
             return reqId is { } id
                 ? BuildFrame(CtpFrontTemplates.BuildQryOrderEmptyRsp(NextQrySeq(), id))
                 : null;

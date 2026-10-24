@@ -389,9 +389,11 @@ internal static class CtpFrontTemplates
         );
 
     /// <summary>
-    /// 查报单空应答（17B——2026-10-03 SimNow 实抓：过滤无匹配报单的合约时真前置回此 tag 帧而非
-    /// LZ4 二进制。大清单（6 行实测 811B）走二进制——「不逆向」，本地前置恒回空表：客户端
-    /// QueryOrderAsync 管线不再被未应答查询堵死（期货页委托 tab 显示空是已知边界）。
+    /// 查报单空应答（13B payload / 17B 线上——2026-10-03 SimNow 实抓：过滤无匹配报单的合约时真前置回此 tag
+    /// 帧而非 LZ4 二进制；**2026-10-24 真前置复抓逐字节一致**（`E104E28001 E303 E707`，见
+    /// <c>RealFrontGoldenFrameTests</c>）。大清单（6 行实测 811B）走二进制——「不逆向」，本地前置恒回空表：
+    /// 客户端 QueryOrderAsync 管线不再被未应答查询堵死（期货页委托 tab 显示空是已知边界；空结果 SDK 不派发
+    /// 回调是其既有行为，真前置同款）。
     /// 结构 = op `E104E28001` + E3 应答流水 + E7 reqId 回显（与 ⑱ 空表同构）。
     /// </summary>
     internal static readonly byte[] QryOrderEmptyRspTemplate = H("0103344CE104E28001E309E708");
