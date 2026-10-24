@@ -94,5 +94,7 @@ public sealed class CtpFrontE2eM3Tests : IDisposable
         // 买卖一档量同理（模板常量 1105/808 即两槽抓包值，offset 86-87 / 92-93）。
         // 卖侧 20 手被吃 1 手 ⇒ 剩 19。
         Assert.Equal(19, tick.AskVolume);
+        // 持仓量（offset 72，5B 槽；模板常量 2457399 与解码值逐字节吻合）——本场 1 手成交 ⇒ 1。
+        Assert.Equal(1, tick.OpenInterest);
     }
 }

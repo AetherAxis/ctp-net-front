@@ -766,10 +766,11 @@ internal static class CtpFrontTemplates
     /// <summary>tick 推送（E4F103 流式 op——E4F101 快照 op 重复推送触发 native 重投，勿改回）；last=最近值、
     /// <b>bid=floor / ask=ceil</b>（对手价回显方向语义：taker 的 IOC 限价恒越过真实价——3B 槽 1/64 ulp &gt;
     /// ax001 0.01 tick 时最近值回显可能低 0.0044 ⇒ noise IOC 够不到真实卖价 ⇒ 双 bot 市场不成交，2026-10-13
-    /// 实测；成交按 maker 价，ceil 无经济副作用），成交量槽 ← <paramref name="volume"/>（原为抓包常量
-    /// `0C 3D CE` = 802254，客户端常年读到冻结量）。</summary>
+    /// 实测；成交按 maker 价，ceil 无经济副作用），成交量/买一卖一档量/持仓量槽 ← 交易所 tick
+    /// （三个量槽原为抓包常量：`0C 3D CE` = 802254、`04 51` = 1105、`03 28` = 808、持仓量 2457399）。</summary>
     internal static byte[] BuildMdTick(string instrumentId, string tradingDay, string updateTime,
-        double lastPrice, double bidPrice, double askPrice, long volume, int bidVolume, int askVolume) =>
+        double lastPrice, double bidPrice, double askPrice, long volume, int bidVolume, int askVolume,
+        double openInterest) =>
         Apply(MdTickTemplate,
             new Edit(32, 8, A(tradingDay)),
             new Edit(16, 5, F(instrumentId, 5)),
@@ -777,6 +778,7 @@ internal static class CtpFrontTemplates
             new Edit(23, 8, A(updateTime)),
             new Edit(56, 3, PriceSlot(lastPrice)),
             new Edit(60, 3, FixedInt3(volume)),
+            new Edit(72, 5, PriceSlot(openInterest, 5)),   // 持仓量：抓包槽 5B（2457399 逐字节吻合）
             new Edit(82, 3, PriceSlot(bidPrice, 3, roundUp: false)),
             new Edit(86, 2, FixedInt2(bidVolume)),
             new Edit(88, 3, PriceSlot(askPrice, 3, roundUp: true)),
