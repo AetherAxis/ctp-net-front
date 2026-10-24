@@ -88,5 +88,8 @@ public sealed class CtpFrontE2eM3Tests : IDisposable
         Assert.Equal(3001, tick.LastPrice);
         Assert.Equal(2999, tick.BidPrice);
         Assert.Equal(3001, tick.AskPrice);
+        // 成交量真实化（2026-10-24）：模板量槽原为抓包常量 802254（客户端常年读到冻结量）；
+        // 现在 ← 交易所 tick 的累计成交量——本场 1 手成交 ⇒ 1。
+        Assert.Equal(1, tick.Volume);
     }
 }

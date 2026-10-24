@@ -758,7 +758,7 @@ internal static class CtpFrontTemplates
             new Edit(35, 8, A(tradingDay))
         );
 
-    // ===== M3 帧 MdTick（109B payload：单合约 E4F103 流式 tick——价格三槽等宽填充，量串 verbatim） =====
+    // ===== M3 帧 MdTick（109B payload：单合约 E4F103 流式 tick——价格三槽 + 成交量槽写入，其余字段 verbatim） =====
     internal static readonly byte[] MdTickTemplate = H(
         "0103344CE4F103E504E1D2E42439E1866D32373031EFEB30323A32313A3139E53230323630393330E16D32373031EFEFEFEFEFE12433E11C40AA56E60C3DCE42192CC8E0E5E0E8E24142BF9B80E32434E11840AA54E7045140AA56E703282481E10840E0E073C994E0E15FE0E6"
     );
@@ -766,15 +766,23 @@ internal static class CtpFrontTemplates
     /// <summary>tick 推送（E4F103 流式 op——E4F101 快照 op 重复推送触发 native 重投，勿改回）；last=最近值、
     /// <b>bid=floor / ask=ceil</b>（对手价回显方向语义：taker 的 IOC 限价恒越过真实价——3B 槽 1/64 ulp &gt;
     /// ax001 0.01 tick 时最近值回显可能低 0.0044 ⇒ noise IOC 够不到真实卖价 ⇒ 双 bot 市场不成交，2026-10-13
-    /// 实测；成交按 maker 价，ceil 无经济副作用），量串 verbatim。</summary>
-    internal static byte[] BuildMdTick(string instrumentId, string tradingDay, string updateTime, double lastPrice, double bidPrice, double askPrice) =>
+    /// 实测；成交按 maker 价，ceil 无经济副作用），成交量槽 ← <paramref name="volume"/>（原为抓包常量
+    /// `0C 3D CE` = 802254，客户端常年读到冻结量）。</summary>
+    internal static byte[] BuildMdTick(string instrumentId, string tradingDay, string updateTime,
+        double lastPrice, double bidPrice, double askPrice, long volume) =>
         Apply(MdTickTemplate,
             new Edit(32, 8, A(tradingDay)),
             new Edit(16, 5, F(instrumentId, 5)),
             new Edit(41, 5, F(instrumentId, 5)),
             new Edit(23, 8, A(updateTime)),
             new Edit(56, 3, PriceSlot(lastPrice)),
+            new Edit(60, 3, FixedInt3(volume)),
             new Edit(82, 3, PriceSlot(bidPrice, 3, roundUp: false)),
             new Edit(88, 3, PriceSlot(askPrice, 3, roundUp: true))
         );
+
+    /// <summary>3B 定宽大端整数（tick 量槽宽度与抓包一致——先验宽度不变，只改值）。
+    /// 槽宽 3B 上限 16777215（真前置该槽抓包即 3B，日均量更大的合约会撑宽——未实测，
+    /// 本地仿真量级远低于此）。</summary>
+    internal static byte[] FixedInt3(long v) => [(byte)(v >> 16), (byte)(v >> 8), (byte)v];
 }
