@@ -82,6 +82,13 @@ dotnet test  Ctp.Net.Front.slnx   # 需 macOS frameworks（CopyCtpMacFrameworks�
 
 **开高低 / 昨结昨收不在线协议里**：同一次探针显示 SDK 从我们的帧解出的 `open/high/low/preSettle/preClose` **全是 0**——这些字段在我们的帧里根本没有（真前置也是稀疏下发：只带变化的字段，所以它的 tick 帧长度在 55/72/74/77/79B 之间跳）。要让它们有值 = 得**新造**带正确 tag 的字段，而各字段的 tag 身份还没逆向出来，硬塞会造成换字段错位（2026-10-13 那类事故）。对当前消费方（Lean market-maker / noise-taker 只用 last/bid/ask/vol）没有收益，故**不做**，记为 §6 #6 的「除非有消费方需要」。成交额 `turnover` 也保持模板常量（该槽带 E0 转义、宽度随值变，改动收益为零）。
 
+**多行查询：先证「标准客户端确实有」，再补实现**（同日第四轮）：查持仓/查报单这类查询，标准 CTP 客户端是
+**逐条回调 + `bIsLast` 收尾**（官方 `ThostFtdcTraderApi.h`：`OnRspQryInvestorPosition(..., bool bIsLast)`、
+`OnRspQryOrder(..., bool bIsLast)`）——多行是协议原生语义，不是我们造的扩展。据此两件事：
+
+- **持仓多行已验证**：新增 `CtpFrontE2eMultiRowTests`——同一账户在两合约各吃 1 手 ⇒ 标准客户端 `QueryInvestorPositionAsync` 收到**两行**（此前多行只有单行样本）。多行出帧靠客户端静默期收尾，无需伪造帧级 isLast。
+- **非空报单是功能缺失，不再沉默**：本前置没有非空报单的应答帧模板（真前置走 LZ4 列式二进制，未逆向），任何查报单都回空表。账户真有活单时客户端看到「委托表为空」是假象——新增 `WarnIfOrdersExistAsync()`，30s 节流把「账户有 N 张委托但未实现」写进日志。补这一项要真前置的**非空**多行帧：SimNow 非 7×24，只在交易时段（开盘前约 30 分钟）可连，需在下一交易日窗口抓。
+
 **真前置 golden 帧回归**（同日第二轮）：拿到 SimNow 官服凭据后，用 ⑨ 的 `proxy` 模式把应答帧重新抓了一遍并落成断言——新增 `tests/Ctp.Net.Front.Tests/RealFrontGoldenFrameTests.cs`（4 例，期望值来自真前置实测字节）：
 
 - 持仓空表 `0103344CE104E28005E302E706`、查报单空表 `0103344CE104E28001E303E707`：与本地模板**逐字节相同**（查报单一项此前只知「SDK 会超时」，实测真前置确实回这个 13B tag 帧，超时是 SDK 对空结果不派发回调的既有行为）。

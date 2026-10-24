@@ -50,6 +50,10 @@ internal sealed class CtpFrontSession : IDisposable
     private State _state = State.WaitingHandshake;
     private readonly CtpFrameParser _parser = new();
 
+    // 查报单缺口告警节流（2026-10-24——多行报单应答帧未实现，见 WarnIfOrdersExistAsync）
+    private DateTime _lastOrderGapWarnAt = DateTime.MinValue;
+    private int _orderGapWarnCount;
+
     // 会话身份（⑤/⑦ 请求中提取）
     private string _userId = "";
     private string _brokerId = "";
@@ -208,6 +212,28 @@ internal sealed class CtpFrontSession : IDisposable
 
     private int _cmdInstanceInt;
     private int NextCmdInstance() => ++_cmdInstanceInt;
+
+    /// <summary>
+    /// 查报单的诚实告警（2026-10-24）：本前置**没有非空报单的应答帧模板**——真前置的非空报单走 LZ4 列式二进制
+    /// （未逆向；已对齐的只有空表那个 13B tag 帧），所以任何查报单都回空表。账户真有活单时，客户端看到的
+    /// 「委托表为空」是假象：这里按 30s 节流把它写进日志，不让缺口静默（这是已知功能缺失，不是真前置行为）。
+    /// </summary>
+    private void WarnIfOrdersExistAsync()
+    {
+        if ((DateTime.UtcNow - _lastOrderGapWarnAt).TotalSeconds < 30) return;
+        _lastOrderGapWarnAt = DateTime.UtcNow;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var orders = await _rpc.QueryOrdersAsync(null, CancellationToken.None);
+                if (orders.Count == 0) return;
+                _log($"[CTP-Front] ⚠ 查报单：账户有 {orders.Count} 张委托，但非空报单应答帧未实现——本次仍回空表" +
+                     $"（客户端看到空委托表是假象；第 {++_orderGapWarnCount} 次告警）");
+            }
+            catch { /* 告警失败不影响查询本身 */ }
+        });
+    }
 
     /// <summary>核心错误码 → wire 错误码（捕获槽 1 字节：>255 的核心码降级为 148 通用码，真码进 GBK 文本前缀）。</summary>
     private static (int Id, string Msg) WireError(CtpBusinessException ex)
@@ -505,9 +531,13 @@ internal sealed class CtpFrontSession : IDisposable
         // Lean 引擎 GetCashBalance 排队超时 → cash=0 → 引擎侧 buying power 拒掉全部订单）。
         // 真前置多行报单走 LZ4 二进制（不逆向）；空表（17B tag 帧）为 SimNow 过滤查询实抓模板，
         // E3 = 应答侧 80 族记录流水（NextQrySeq——二进制 6 行内部消耗 6 个号、空应答接续）。
+        // <b>这是已知功能缺失</b>：标准 CTP 客户端的报单查询是「逐条回调 + bIsLast 收尾」
+        // （官方 ThostFtdcTraderApi.h 的 OnRspQryOrder），有委托就该有行；本前置没有非空报单的帧模板，
+        // 只能回空表 —— 账户真有活单时由 WarnIfOrdersExistAsync 喊进日志（2026-10-24）。
         if (MatchesSignature(body, "E104E280E4"))
         {
             var reqId = ExtractReqIdAfter(body, "E101E1CDE3");
+            WarnIfOrdersExistAsync();   // 有活单却回空表 ⇒ 必须喊出来（见方法注释）
             _log($"[CTP-Front] 查报单 reqId={reqId} → 13B payload tag 空表（17B 线上；2026-10-24 真前置实抓逐字节一致，SDK 30s 超时后管线恢复——真前置同款行为）");
             return reqId is { } id
                 ? BuildFrame(CtpFrontTemplates.BuildQryOrderEmptyRsp(NextQrySeq(), id))
