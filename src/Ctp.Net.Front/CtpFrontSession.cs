@@ -577,7 +577,7 @@ internal sealed class CtpFrontSession : IDisposable
             var frames = picked.Select((o, i) => BuildFrame(CtpFrontTemplates.BuildQryOrderRsp(
                 counter + i, id, _brokerId, _userId, o.InstrumentId, o.ExchangeId, o.OrderRef,
                 (char)o.PriceType, (char)o.Direction, (char)o.OffsetFlag, o.LimitPrice, o.VolumeTotalOriginal,
-                '3', (char)o.OrderStatusRaw, OrderStatusMsg(o), day, o.InsertTime))).ToArray();
+                o.VolumeTotal, '3', (char)o.OrderStatusRaw, OrderStatusMsg(o), day, o.InsertTime))).ToArray();
             var buf = new byte[frames.Sum(b => b.Length)];
             var off = 0;
             foreach (var b in frames) { b.CopyTo(buf, off); off += b.Length; }

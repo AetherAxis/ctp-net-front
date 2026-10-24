@@ -522,7 +522,7 @@ internal static class CtpFrontTemplates
     /// </summary>
     internal static byte[] BuildQryOrderRsp(int instance, byte reqId, string brokerId, string investorId,
         string instrumentId, string exchangeId, string orderRef, char priceType, char direction, char offsetFlag,
-        double limitPrice, int volume, char timeCondition, char orderStatus, string statusMsg,
+        double limitPrice, int volume, int volumeTotal, char timeCondition, char orderStatus, string statusMsg,
         string tradingDay, string insertTime) =>
         Apply(QryOrderRspTemplate,
             new Edit(9, 2, InstanceField(instance)),
@@ -545,6 +545,9 @@ internal static class CtpFrontTemplates
             new Edit(342, 5, F(instrumentId, 5)),
             new Edit(175, 8, F(tradingDay, 8)),   // 定宽：空交易日也不许缩帧
             new Edit(200, 1, [(byte)orderStatus]),
+            // 剩余未成交量（2026-10-24 整帧 patch-scan 定案：本槽 = payload @203，改它客户端 VolumeTotal 就跟着变）。
+            // 同 @54 持仓量槽：1B 捕获宽，量 >127 时 MinimalInt 2B 撑宽（tag 终结的 int run 允许伸缩，未实测大值边界）。
+            new Edit(203, 1, MinimalInt(volumeTotal)),
             new Edit(204, 8, F(tradingDay, 8)),
             new Edit(213, 8, F(insertTime, 8)),
             new Edit(232, 39, Cat(H("EB"), EscapedGbkFixed(statusMsg.Length == 0 ? " " : statusMsg, QryOrderMsgWidth)))
@@ -622,7 +625,9 @@ internal static class CtpFrontTemplates
             new Edit(180, 8, A(tradingDay))
         );
 
-    // ===== M2 帧 OnRtnOrder '0'（399B payload：全部成交推送——F001；VolumeTraded 保留捕获值 1，>1 手的全成回报成交量失真（边界）） =====
+    // ===== M2 帧 OnRtnOrder '0'（399B payload：全部成交推送——F001；VolumeTraded 保留捕获值 1，>1 手的全成回报成交量失真（边界）
+// 2026-10-24 复核：同族的查报单记录帧经整帧 patch-scan + 阳性对照**证否不含 VolumeTraded 槽**；推送族 '3' 模板
+// 扫了 140 个候选字节（多数补丁直接破帧 → NO-PUSH）仍未定位 ⇒ 保持模板值，成交数一律靠 OnRtnTrade 推送收敛。） =====
     internal static readonly byte[] RtnOrder0Template = H(
         "0103344CE102E2F001E309E1010353E40401034F39393939E7323437313633E76D32373031EFEB303030303030303030303033E1323437313633EA323030E431E440AA90E80133E931E30131E830EFEE202020202020202034363537E1444345E16D323730E139393939E131E3C9E139393939323437313431E16D32373031EFEB39393939636166E139393939E131E131E1393939E40130E43230323630393239E401202020202020202039353038E9303030E301E43230323630393239E131303A35303A3530EFEFE739393939636166EFEC1342E301C8E0E69C40EBC8ABB2BFB3C9BDBBB1A8B5A5D2D1CCE0E1BDBBEFEFEFEFE810E710E8655AE17FE3FDE66F70369F8C7FECFFFFFFE39CEFEFE53138302E3135382E3233322E313837EFE76D32373031EFEFEFEFEFE16D32373031E16DE131E132303237E131E131303030E131E131303030E131E13130E131E13230323630313139E13230323630313139E13230323730313135E13230323730313135E13230323730313230E13138302E3135382E3233322E313837EFEFE402"
     );

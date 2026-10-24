@@ -62,8 +62,38 @@ public sealed class CtpFrontE2eOrderQueryTests : IDisposable
         Assert.Equal(OrderPriceType.Limit, row.PriceType);
         Assert.Equal(2900, row.LimitPrice);
         Assert.Equal(3, row.VolumeTotalOriginal);
+        Assert.Equal(3, row.VolumeTotal);          // 未成交 ⇒ 剩余 = 原始量（槽位 @203，2026-10-24 探针定案）
         Assert.Equal('3', (char)row.OrderStatusRaw);
         Assert.Matches(@"^\d{2}:\d{2}:\d{2}$", row.InsertTime);
+    }
+
+    [Fact]
+    public async Task 查报单_部分成交_剩余量是真剩余()
+    {
+        // ax001 卖盘只挂 1 手 ⇒ 买 3 手成交 1 手、余 2 手挂住
+        _sim.Core.InsertOrder("mm3", new Aether.Exchange.OrderRequest
+        {
+            BrokerId = FrontLoopback.Broker, InvestorId = "mm3", InstrumentId = Other,
+            Direction = Aether.Exchange.Direction.Sell, OffsetFlag = Aether.Exchange.OffsetFlag.Open,
+            PriceType = Aether.Exchange.OrderPriceType.Limit, LimitPrice = 3000, Volume = 1,
+        });
+
+        using var trader = await LoginAsync();
+        await trader.OrderInsertAsync(new OrderRequest
+        {
+            InvestorId = User, BrokerId = FrontLoopback.Broker, InstrumentId = Other,
+            Direction = Direction.Buy, OffsetFlag = OffsetFlag.Open,
+            PriceType = OrderPriceType.Limit, LimitPrice = 3000, Volume = 3, ExchangeId = "DCE",
+        });
+
+        var rows = await trader.QueryOrderAsync(FrontLoopback.Broker, User);
+
+        var row = Assert.Single(rows);
+        Assert.Equal(3, row.VolumeTotalOriginal);
+        Assert.Equal(2, row.VolumeTotal);          // 3 − 成交 1：剩余量槽是真值（旧实现恒回模板 1）
+        Assert.Equal('1', (char)row.OrderStatusRaw);   // 部分成交在队
+        // VolumeTraded 仍解出 0：整帧 patch-scan 已证本记录帧**不含该槽**（2026-10-24，带阳性对照），
+        // 客户端靠 OnRtnTrade 推送收敛成交数——与真前置同款边界，不是本前置的编码缺陷。
     }
 
     [Fact]
