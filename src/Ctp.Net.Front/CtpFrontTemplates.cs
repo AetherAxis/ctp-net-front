@@ -206,21 +206,10 @@ internal static class CtpFrontTemplates
     }
 
     /// <summary>GBK 文本 + E0 转义（⑳ 实证：值内 {E0..EF,FE} 字节前插 E0，E0 自身亦转义——与 EscapedMoney 同一字母表）。</summary>
-    internal static byte[] EscapedGbk(string text)
-    {
-        var raw = Encoding.GetEncoding("GBK").GetBytes(text);
-        var n = 0;
-        foreach (var b in raw)
-            if (b is (>= 0xE0 and <= 0xEF) or 0xFE) n++;
-        var r = new byte[raw.Length + n];
-        var i = 0;
-        foreach (var b in raw)
-        {
-            if (b is (>= 0xE0 and <= 0xEF) or 0xFE) r[i++] = 0xE0;
-            r[i++] = b;
-        }
-        return r;
-    }
+    internal static byte[] EscapedGbk(string text) => EscapedValue(Gbk(text));
+
+    /// <summary>GBK 原始字节（未转义）——查交易所的「简称槽 = 7 − ID 长度」按这个宽度算，转义膨胀不计。</summary>
+    internal static byte[] Gbk(string text) => Encoding.GetEncoding("GBK").GetBytes(text);
 
     internal readonly record struct Edit(int Offset, int OldLen, byte[] NewBytes);
 
@@ -418,6 +407,66 @@ internal static class CtpFrontTemplates
             new Edit(9, 2, InstanceField(e3Value)),
             new Edit(12, 1, EscapedValue(reqId))
         );
+
+    // ===== 帧 查交易所（真前置 2026-10-24 实抓：请求 op `E104E2802A`（26B）、应答 op `E104E2802B`
+    // （255B payload，**1 帧 N 条记录**）。头 = `E1 04 E2 80 2B | E3 <流水> | E1 <条数> | 01 C2 | E3 <reqId>`；
+    // 记录 = `E1 01 | E1 47 <ExchangeID> | E1 <简称槽> | E1 <GBK 全称> | E1 <'0'/'1'> | E1 31 | [E2/E3 30 E1 31] | EF EF | E7/E8/E9 <'0'/'1'>`
+    // （真帧 6 条里 E2/E3 组时有时无，尾部随名称长度变；本前置按名称长度二选一，见 BuildQryExchangeRsp 备注）。
+    /// <summary>查交易所应答（<c>OnRspQryExchange</c>）：1 帧 N 条记录，字段以 <c>E1</c> 分隔。</summary>
+    /// <remarks>
+    /// 2026-10-24 真前置实抓（255B payload / 6 条）逐字节逆向后定案的三条硬约束——违反任一条，SDK 会静默丢记录或把字段读串：
+    /// <list type="number">
+    /// <item><b>ExchangeID + 简称槽 = 7 字节</b>：真帧六家分别 CFFEX5+2、SHFE4+3、DCE3+4、CZCE4+3、INE3+4、GFEX4+3。
+    /// 简称槽内容是简称的前若干**未转义**字节（不够时续全称前缀；可在汉字中间截断，转义膨胀不算宽度）——SDK 不读它，只用来把名称顶到固定偏移 13。实测 ID 长度 2/4/6 配固定 4 字节简称会整帧错位。</item>
+    /// <item><b>记录总长 39 或 41 字节</b>（真帧：名称 14B ⇒ 39、18B ⇒ 39、20B ⇒ 41）。名称过短（如 10B/12B/16B）时记录只有 31~37 字节，SDK 丢该条并连带丢后续记录。</item>
+    /// <item><b>尾部形态与名称长度配套</b>：名称 ≤16B 用短尾 <c>E1&lt;prop&gt; E1 31 E3 30 E1 31 EF EF E7&lt;prop&gt;</c>（12B），
+    /// &gt;16B 用长名尾 <c>E1&lt;prop&gt; E1 31 EF EF E9&lt;prop&gt;</c>（8B）。塞进多余的字段组会把 Property 读成 0。</item>
+    /// </list>
+    /// 边界：ExchangeID 需 ≤ 6 字符（真帧 3~5），更长的 ID 无法凑出 7 字节槽，本帧不出该条；
+    /// 名称建议 7~10 个汉字（14~20B），更长的组合尚未在真前置上验证。
+    /// </remarks>
+    internal static byte[] BuildQryExchangeRsp(int counter, byte reqId,
+        IReadOnlyList<(string ExchangeId, string ShortName, string FullName, byte Property)> rows)
+    {
+        var body = new List<byte>();
+        body.AddRange(H("0103344CE104E2802B"));
+        body.AddRange(Cat(H("E3"), EscapedValue(MinimalInt(counter))));
+        var usable = rows.Where(r => System.Text.Encoding.ASCII.GetByteCount(r.ExchangeId) < QryExchangeIdShortWidth).ToList();
+        body.AddRange([0xE1, (byte)usable.Count]);        // 条数槽（真帧 6 条 ⇒ 0x06）
+        body.AddRange(H("01C2"));
+        body.AddRange(Cat(H("E3"), EscapedValue(reqId)));
+        foreach (var r in usable)
+        {
+            var gbk = Gbk(r.FullName);                     // GBK 原始字节（未转义）
+            body.AddRange(H("E101E147"));                  // 记录起始 + ExchangeID 字段标记
+            body.AddRange(A(r.ExchangeId));
+            var padWidth = QryExchangeIdShortWidth - System.Text.Encoding.ASCII.GetByteCount(r.ExchangeId);
+            body.AddRange(H("E1"));                        // 简称槽：按**未转义**字节补足 7（内容被 SDK 丢弃）
+            body.AddRange(EscapedValue(Cat(Gbk(r.ShortName), gbk).Take(padWidth).ToArray()));
+            body.AddRange(H("E1"));
+            body.AddRange(EscapedValue(gbk));
+            body.AddRange([0xE1, r.Property]);
+            body.AddRange(gbk.Length <= 16 ? H("E131E330E131EFEFE7") : H("E131EFEFE9"));
+            body.AddRange([r.Property]);
+        }
+        return body.ToArray();
+    }
+
+    /// <summary>查交易所应答里 ExchangeID 与「简称槽」的合计宽度（真帧实测恒为 7 字节）。</summary>
+    private const int QryExchangeIdShortWidth = 7;
+
+    /// <summary>交易所中英文名（真前置 GBK 全称；仿真自有交易所直接用 id）——查交易所应答的名称来源。</summary>
+    internal static (string Short, string Full) ExchangeNameOf(string exchangeId) => exchangeId.ToUpperInvariant() switch
+    {
+        "DCE" => ("大连", "大连商品交易所"),
+        "SHFE" => ("上海", "上海期货交易所"),
+        "CZCE" => ("郑州", "郑州商品交易所"),
+        "CFFEX" => ("中国", "中国金融期货交易所"),
+        "INE" => ("上海", "上海国际能源交易中心"),
+        "GFEX" => ("广州", "广州期货交易所"),
+        // 仿真自有交易所（如 AETHER）：名称槽用 GBK 中文，ID 才是身份；ASCII 名未验证，不冒险
+        _ => ("合成", "合成期货交易所"),   // 7 个汉字 = 14B，与真帧 DCE/SHFE/CZCE 同形（记录 39B）
+    };
 
     /// <summary>
     /// 查结算单空应答（13B payload / 17B 线上——2026-10-24 真前置实抓逐字节：请求 op `E104E2803C`、

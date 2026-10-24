@@ -40,6 +40,7 @@
 | 15 | `SubscribeMarketData` | `E44401` | 订阅 → tick 推送 | 实订成功 |
 | 16 | （推送）`RtnOrder`/`RtnTrade`/`RtnDepthMarketData` | — | 已实现 | bot 实跑 |
 | 17 | `ReqQrySettlementInfo` | `E104E2803C` | 查结算单 → 13B tag 空表（真前置同形逐字节；**非空正文未逆向**） | 真前置实抓帧 + golden 断言 + E2E |
+| 18 | `ReqQryExchange` | `E104E2802A` | 查交易所 → 逐行 tag 记录帧（255B payload / 6 条真帧逆向，2026-10-24） | 真前置实抓帧 + 2 行 E2E（`CtpFrontE2eExchangeQueryTests`） |
 
 ## 2. 已实现但有缺口
 
@@ -48,6 +49,7 @@
 | `ReqQryOrder` 非空 | **已实现**（2026-10-24）；剩余边界见下 | 真前置 1 行回 tag 记录帧、≥2 行走列式二进制；本前置恒用 tag 记录帧逐行。边界：① `VolumeTraded` **整帧 patch-scan 证否**（含阳性对照：本记录帧压根没有这个槽，真前置同款 ⇒ 客户端对部分成交显示「成 0」，靠 `OnRtnTrade` 收敛）；`VolumeTotal` 槽已定案 = payload @203（2026-10-24 探针，部分成交 E2E 断言真剩余 2）② 状态消息槽定宽 38B（改宽整帧被 SDK 丢弃）③ 账本无日期维度 ⇒ 活单优先 + 封顶 200 行 |
 | `ReqQryTrade` 非空 | **已实现**（2026-10-24）；剩余边界见下 | 284B 记录帧（真前置实成交样本）。边界：① 成交号槽**定宽 4**（左补零/超宽截尾 ⇒ 单账户日内 >9999 笔会撞号）② ≥2 笔时真前置走列式二进制，本前置仍按 tag 记录帧逐行下发（靠 wrapper 静默期收尾） |
 | `ReqQrySettlementInfo` 非空 | 只回空表（真前置对无结算单账户也是空表，同形逐字节） | 非空正文需要**真有结算单的账户**样本；SimNow 测试账户实测 4 个交易日全空 |
+| `ReqQryExchange` 记录格式 | 已实现（2026-10-24）；边界见下 | ① `ExchangeID + 简称槽 = 7 字节`（真帧 6 家无一例外；简称槽被 SDK 丢弃，只负责把名称顶到固定偏移 13）② 记录总长必须 **39 或 41 字节**（名称过短 ⇒ 31~37，SDK 丢该条并连带丢后续）③ 尾部形态与名称长度配套（≤16B 用 12B 短尾、>16B 用 8B 长名尾；多塞 `E2/E3` 字段组会把 Property 读成 0）。⇒ 本前置 ExchangeID ≤ 6 字符、名称 7~10 汉字；更长的组合未在真前置验证 |
 | `ReqQryInstrument` 空结果 | 过滤到不存在的合约 ⇒ 客户端 30s 超时 | 真前置其实会派发「空记录 + isLast」，但**本前置这条路不敢转发**（见 §4 的崩溃证据） |
 | 行情退订 `UnSubscribeMarketData` | 未实现 | 客户端与前置都没有 |
 | tick 字段 | 开高低/昨结昨收缺 | 成交量/档量/持仓量已真实化 |
@@ -59,7 +61,7 @@
 | ~~1~~ | ~~`ReqQrySettlementInfo` 查结算单~~ **2026-10-24 已实现（空表路径）** | 结算单/出入金核查 | ② 已导出 `QuerySettlementInfoAsync`（原生 wrapper 同步扩）；**非空正文**（账户真有结算单时）未逆向——SimNow 测试账户任何交易日都回空表，取不到样本 |
 | 2 | `ReqQrySettlementInfoConfirm` | 今日是否已确认 | ② 未导出 |
 | 3 | `ReqQryInvestor` 查投资者 | 客户信息/权限 | ② 未导出 |
-| 4 | `ReqQryExchange` 查交易所 | 交易所列表 | ② 未导出 |
+| ~~4~~ | ~~`ReqQryExchange` 查交易所~~ **2026-10-24 已实现** | 交易所列表 | ② 已导出 `QueryExchangeAsync`（原生 wrapper 同步扩，GBK 名称用 `ByValArray` + GB18030）；记录帧三条硬约束见 §2 |
 | 5 | `ReqQryTradingCode` 查交易编码 | 多编码账户 | ② 未导出 |
 | 6 | `ReqQryInstrumentMarginRate` 保证金率 | 开仓前算占用 | ② 未导出 |
 | 7 | `ReqQryInstrumentCommissionRate` 手续费率 | 成本预估 | ② 未导出 |

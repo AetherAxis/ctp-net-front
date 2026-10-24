@@ -520,6 +520,31 @@ internal sealed class CtpFrontSession : IDisposable
             return buf;
         }
 
+        // 查交易所请求: E1 04 E2 80 2A（真前置 2026-10-24 实抓：应答 op=2B、1 帧 N 条记录，reqId 在 E1 01 E1 0D E3 后）。
+        // 交易所列表取自上架合约的 ExchangeId；真交易所用真前置的中文名，仿真自有交易所（AETHER）回「合成期货交易所」
+        // ——名称长度决定记录宽度（14B ⇒ 39B 记录），故兜底名不能随手写短。
+        if (MatchesSignature(body, "E104E2802A"))
+        {
+            var exchReqId = ExtractReqIdAfter(body, "E101E10DE3");
+            var listedForExch = await _rpc.QueryInstrumentsAsync(ct);
+            if (exchReqId is not { } exId) return null;
+            var rows = listedForExch.Select(i => i.ExchangeId)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x, StringComparer.Ordinal)
+                .Select(x =>
+                {
+                    var (shortName, fullName) = CtpFrontTemplates.ExchangeNameOf(x);
+                    return (ExchangeId: x, ShortName: shortName, FullName: fullName, Property: (byte)'1');
+                })
+                .ToList();
+            var dropped = rows.Where(r => r.ExchangeId.Length >= 7).Select(r => r.ExchangeId).ToList();
+            if (dropped.Count > 0)
+                _log($"[CTP-Front] 查交易所：ExchangeID 过长（≥7 字符，凑不出 7 字节 ID+简称槽）已跳过: {string.Join(",", dropped)}");
+            _log($"[CTP-Front] 查交易所 reqId={exId} → {rows.Count - dropped.Count} 个: {string.Join(",", rows.Where(r => r.ExchangeId.Length < 7).Select(r => r.ExchangeId))}");
+            return BuildFrame(CtpFrontTemplates.BuildQryExchangeRsp(NextQrySeq(), exId, rows));
+        }
+
         // 查结算单请求: E1 04 E2 80 3C（真前置 2026-10-24 实抓：请求 op=3C、应答 op=3D，reqId 在 E1 01 E1 36 E3 后）。
         // 必须应答——不回会让标准客户端的查询管线白等 30s。真前置对「当日无结算单」回 13B tag 空表（与其它空表同形）；
         // **非空（有结算单正文）**需要真样本才能逆向（同 ⑲ 查成交的路径），此前一律回空表。
