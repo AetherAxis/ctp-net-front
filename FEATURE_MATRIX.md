@@ -60,7 +60,7 @@
 |---|---|---|---|
 | ~~1~~ | ~~`ReqQrySettlementInfo` 查结算单~~ **2026-10-24 已实现（空表路径）** | 结算单/出入金核查 | ② 已导出 `QuerySettlementInfoAsync`（原生 wrapper 同步扩）；**非空正文**（账户真有结算单时）未逆向——SimNow 测试账户任何交易日都回空表，取不到样本 |
 | 2 | `ReqQrySettlementInfoConfirm` | 今日是否已确认 | ② 未导出 |
-| 3 | `ReqQryInvestor` 查投资者 | 客户信息/权限 | ② 未导出 |
+| ~~3~~ | ~~`ReqQryInvestor` 查投资者~~ **② 已导出（2026-10-24），⑤ 待逆向** | 客户信息/权限 | ② 新增 `QueryInvestorAsync`（原生 wrapper + GBK 名称解码），**真前置实测通过**（1 条：247163 程群）。真帧已抓：请求 op `E104E28008`、应答 op `E104E28009`（353B payload，1 条记录）。⑤ 侧卡在记录帧逆向：投资者记录 60+ 字段、字段以 `E1`(ASCII)/`E2`(GBK)/`E3`(int)/`E4`… 分型重复下发（如 `E1 "247163" E1 "9999" E2 程群 E2 程群 E1 "1" …`），槽位与定长约束都没摸清——猜错整帧被 SDK 丢弃，不能像交易所那样盲试 |
 | ~~4~~ | ~~`ReqQryExchange` 查交易所~~ **2026-10-24 已实现** | 交易所列表 | ② 已导出 `QueryExchangeAsync`（原生 wrapper 同步扩，GBK 名称用 `ByValArray` + GB18030）；记录帧三条硬约束见 §2 |
 | 5 | `ReqQryTradingCode` 查交易编码 | 多编码账户 | ② 未导出 |
 | 6 | `ReqQryInstrumentMarginRate` 保证金率 | 开仓前算占用 | ② 未导出 |
