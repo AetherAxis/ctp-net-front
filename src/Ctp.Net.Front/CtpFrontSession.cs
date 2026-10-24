@@ -520,6 +520,17 @@ internal sealed class CtpFrontSession : IDisposable
             return buf;
         }
 
+        // 查结算单请求: E1 04 E2 80 3C（真前置 2026-10-24 实抓：请求 op=3C、应答 op=3D，reqId 在 E1 01 E1 36 E3 后）。
+        // 必须应答——不回会让标准客户端的查询管线白等 30s。真前置对「当日无结算单」回 13B tag 空表（与其它空表同形）；
+        // **非空（有结算单正文）**需要真样本才能逆向（同 ⑲ 查成交的路径），此前一律回空表。
+        if (MatchesSignature(body, "E104E2803C"))
+        {
+            var settleReqId = ExtractReqIdAfter(body, "E101E136E3");
+            if (settleReqId is not { } sid) return null;
+            _log($"[CTP-Front] 查结算单 reqId={sid} → 13B payload tag 空表（真前置同款形状）");
+            return BuildFrame(CtpFrontTemplates.BuildQrySettlementInfoEmptyRsp(NextQrySeq(), sid));
+        }
+
         // 查成交请求: E1 04 E2 80 02（真前置 2026-10-24 实抓：请求 op=02、应答 op=03，reqId 在 E1 01 E1 CD E3 后）。
         // **必须应答**——不回会让标准客户端的查询管线白等 30s。0 笔 = 13B 空表 tag 帧（与真前置同形逐字节）；
         // 非空 = 每笔成交一帧 tag 记录帧（⑲ 284B 模板，2026-10-24 用真前置实成交样本逆向完成）。

@@ -40,6 +40,13 @@ public sealed class RealFrontGoldenFrameTests
     }
 
     [Fact]
+    public void 查结算单空表应答_与真前置逐字节一致()
+    {
+        // 真帧：2026-10-24 实抓 `0103344C E104E2803D E301 E705`（instance 01 / reqId 05）
+        Assert.Equal("0103344CE104E2803DE301E705", Hex(CtpFrontTemplates.BuildQrySettlementInfoEmptyRsp(1, 0x05)));
+    }
+
+    [Fact]
     public void 资金应答_线上宽度与真前置一致()
     {
         // 真帧：balance 999927.69（E0 转义后 10B/槽）、6 字符账户 → payload 134B（+4B 帧头 = 138B 线上）。

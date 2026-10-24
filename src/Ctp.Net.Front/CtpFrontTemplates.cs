@@ -419,6 +419,20 @@ internal static class CtpFrontTemplates
             new Edit(12, 1, EscapedValue(reqId))
         );
 
+    /// <summary>
+    /// 查结算单空应答（13B payload / 17B 线上——2026-10-24 真前置实抓逐字节：请求 op `E104E2803C`、
+    /// 应答 op `E104E2803D`，帧形与查报单/查成交空表同构：`0103344C E104E2803D E3 01 E7 05`）。
+    /// SimNow 测试账户当日无结算单，真前置就回这一帧（客户端 0 条、立即完成）。
+    /// </summary>
+    internal static readonly byte[] QrySettlementInfoEmptyRspTemplate = H("0103344CE104E2803DE301E707");
+
+    /// <summary>查结算单空应答（E3 值槽 = offset 10、E7 reqId 值槽 = offset 12——与其它空表同槽位）。</summary>
+    internal static byte[] BuildQrySettlementInfoEmptyRsp(int e3Value, byte reqId) =>
+        Apply(QrySettlementInfoEmptyRspTemplate,
+            new Edit(9, 2, InstanceField(e3Value)),
+            new Edit(12, 1, EscapedValue(reqId))
+        );
+
     // ===== 帧 ⑲ 查成交应答·非空单行（284B payload——2026-10-24 真前置实抓：账户 1 笔 m2701 成交
     // 1@3279 TradeID=2344。真前置 0 行回 13B 空表、≥2 行走列式二进制；本前置恒用本 tag 记录帧逐行。
     // 槽位按 CTP TThostFtdcTradeField 的字段序解码并与探针实证互证：流水@9 / reqId 值@17 / Broker@23,41,97,168 /
