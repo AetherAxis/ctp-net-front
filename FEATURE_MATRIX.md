@@ -37,7 +37,7 @@
 | 12 | `ReqQryTrade` | `E104E28002` | 查成交 → 空结果 13B tag 空表；非空**逐行 tag 记录帧**（284B 模板，2026-10-24 用真前置实成交样本逆向完成） | 真前置实抓空帧/实成交帧 + 空表 E2E + 单行 E2E |
 | 13 | 心跳 | 6B / 5B | 原样回射 | 不回射 ⇒ 30–60s 停摆（实证） |
 | 14 | `Md ReqUserLogin` | — | 行情登录 | 实连成功 |
-| 15 | `SubscribeMarketData` | `E44401` | 订阅 → tick 推送 | 实订成功 |
+| 15 | `SubscribeMarketData` | `E44401` | 订阅 → tick 推送（已做**同值快照去重**，见 DESIGN P1#7b） | 实订成功 |
 | 16 | （推送）`RtnOrder`/`RtnTrade`/`RtnDepthMarketData` | — | 已实现 | bot 实跑 |
 | 17 | `ReqQrySettlementInfo` | `E104E2803C` | 查结算单 → 13B tag 空表（真前置同形逐字节；**非空正文未逆向**） | 真前置实抓帧 + golden 断言 + E2E |
 | 18 | `ReqQryExchange` | `E104E2802A` | 查交易所 → 逐行 tag 记录帧（255B payload / 6 条真帧逆向，2026-10-24） | 真前置实抓帧 + 2 行 E2E（`CtpFrontE2eExchangeQueryTests`） |
@@ -53,6 +53,7 @@
 | `ReqQryInstrument` 空结果 | 过滤到不存在的合约 ⇒ 客户端 30s 超时 | 真前置其实会派发「空记录 + isLast」，但**本前置这条路不敢转发**（见 §4 的崩溃证据） |
 | 行情退订 `UnSubscribeMarketData` | 未实现 | 客户端与前置都没有 |
 | tick 字段 | 开高低/昨结昨收缺 | 成交量/档量/持仓量已真实化 |
+| tick 重复下发 | 同值快照逐字节相同也照发（客户端日志 4 连发，风暴时几百帧/秒） | 2026-10-25：按合约逐字节去重，日志标注「去重跳过 N」 |
 
 ## 3. 正常客户端会用、但没实现（按优先级）
 

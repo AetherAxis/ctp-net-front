@@ -31,6 +31,10 @@ internal sealed class CtpFrontMdSession : IDisposable
     private readonly CtpFrameParser _parser = new();
     private readonly HashSet<string> _subscribed = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>每合约最后一帧推送（同值快照去重的比较基准）；<see cref="_suppressedTicks"/> 只用于日志，告诉运维「静默」是被去重还是真没数据。</summary>
+    private readonly Dictionary<string, byte[]> _lastTickFrame = new(StringComparer.OrdinalIgnoreCase);
+    private int _suppressedTicks;
+
     // 交易所时钟缓存（MD 登录时经 quotes op 取——tick 的 day/time 空值兜底，替代进程内直调核心时钟）
     private string _tradingDay = "";
     private string _timeOfDay = "";
@@ -272,12 +276,26 @@ internal sealed class CtpFrontMdSession : IDisposable
     {
         if (_state != State.Ready || !_subscribed.Contains(tick.InstrumentId)) return;
         var day = string.IsNullOrEmpty(tick.TradingDay) ? _tradingDay : tick.TradingDay;
-        _log($"→ 推送 tick: {tick.InstrumentId} last={tick.LastPrice} bid={tick.BidPrice} ask={tick.AskPrice}");
         // tick 推送（E4F103 流式 op——2026-10-02 长会话抓包定案：旧模板误用 E4F101 一次性快照 op，
         // 重复推送快照帧触发 native 无限重投；E4F103 是真实 tick 流 op，481 帧/次会话 SDK 零洪水）
-        RoutePush(BuildFrame(CtpFrontTemplates.BuildMdTick(tick.InstrumentId, day,
+        var frame = BuildFrame(CtpFrontTemplates.BuildMdTick(tick.InstrumentId, day,
             string.IsNullOrEmpty(tick.UpdateTime) ? _timeOfDay : tick.UpdateTime,
-            tick.LastPrice, tick.BidPrice, tick.AskPrice, tick.Volume, tick.BidVolume, tick.AskVolume, tick.OpenInterest)));
+            tick.LastPrice, tick.BidPrice, tick.AskPrice, tick.Volume, tick.BidVolume, tick.AskVolume, tick.OpenInterest));
+
+        // 同值快照去重（2026-10-25）：交易所对每次簿变更都发 tick，做市商阶梯撤改会把同一快照连发多次
+        // （客户端日志实测同一 tick 连出 4 次；极端情况下一笔不变快照被刷到几百次/秒）。逐字节相同的帧
+        // 对客户端没有任何新信息，只会放大带宽与 native 侧的重复处理。去重后「每秒推送数」才有意义。
+        if (_lastTickFrame.TryGetValue(tick.InstrumentId, out var previous) && previous.AsSpan().SequenceEqual(frame))
+        {
+            _suppressedTicks++;
+            return;
+        }
+        _lastTickFrame[tick.InstrumentId] = frame;
+
+        _log($"→ 推送 tick: {tick.InstrumentId} last={tick.LastPrice} bid={tick.BidPrice} ask={tick.AskPrice}" +
+             (_suppressedTicks > 0 ? $"（去重跳过 {_suppressedTicks}）" : ""));
+        _suppressedTicks = 0;
+        RoutePush(frame);
     }
 
     // —— 工具（与交易腿同款规则）——
