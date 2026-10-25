@@ -1001,12 +1001,35 @@ internal static class CtpFrontTemplates
             new Edit(92, 2, FixedInt2(askVolume))
         );
 
-    /// <summary>3B 定宽大端整数（总成交量槽——宽度与抓包一致，先验宽度不变，只改值）。
-    /// 槽宽 3B 上限 16777215（真前置该槽抓包即 3B，日均量更大的合约会撑宽——未实测，
-    /// 本地仿真量级远低于此）。</summary>
-    internal static byte[] FixedInt3(long v) => [(byte)(v >> 16), (byte)(v >> 8), (byte)v];
+    /// <summary>3B 大端整数（总成交量槽——抓包宽度 3B，先验宽度不变，只改值）。值上限 16777215。</summary>
+    internal static byte[] FixedInt3(long v) => EscapedRaw([(byte)(v >> 16), (byte)(v >> 8), (byte)v]);
 
-    /// <summary>2B 定宽大端整数（买一/卖一档量槽——抓包值 1105/808 与客户端解码值逐位吻合，
-    /// 见 <see cref="BuildMdTick"/>；上限 65535）。</summary>
-    internal static byte[] FixedInt2(int v) => [(byte)(v >> 8), (byte)v];
+    /// <summary>2B 大端整数（买一/卖一档量槽——抓包值 1105/808 与客户端解码值逐位吻合，见
+    /// <see cref="BuildMdTick"/>）。值上限 65535。</summary>
+    internal static byte[] FixedInt2(int v) => EscapedRaw([(byte)(v >> 8), (byte)v]);
+
+    /// <summary>
+    /// 数字槽原字节 + <b>E0 转义</b>（值内 {E0..EF,FE} 字节前插 E0，E0 自身亦转义——与
+    /// <see cref="EscapedValue"/>/<see cref="EscapedMoney"/> 同一字母表）。
+    /// <para>
+    /// <b>2026-10-25 事故定案</b>：这三个量槽原先裸插字节。成交量 11749 = <c>00 2D E5</c>，低位 0xE5 落在
+    /// 标记字母表里 ⇒ 客户端按标记切字段直接错位（帧长仍对，但字段边界全乱）⇒ native 侧进入**同一笔
+    /// tick 的无限重投**：bot 日志 30 秒涨到 160MB、行情假死、盘口时间戳停在同一毫秒。
+    /// 价格槽靠 <see cref="PriceSlot"/> 的「避 tag 递减 1 ulp」躲过这一劫，量槽不能改值（会谎报成交量），
+    /// 只能按协议转义——帧长因此可变，4B 帧头带真实长度，客户端按长度读帧。
+    /// </para>
+    /// </summary>
+    internal static byte[] EscapedRaw(byte[] raw)
+    {
+        var extra = raw.Count(b => b is (>= 0xE0 and <= 0xEF) or 0xFE);
+        if (extra == 0) return raw;
+        var r = new byte[raw.Length + extra];
+        var i = 0;
+        foreach (var b in raw)
+        {
+            if (b is (>= 0xE0 and <= 0xEF) or 0xFE) r[i++] = 0xE0;
+            r[i++] = b;
+        }
+        return r;
+    }
 }

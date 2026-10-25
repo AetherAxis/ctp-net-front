@@ -97,4 +97,62 @@ public sealed class CtpFrontE2eM3Tests : IDisposable
         // 持仓量（offset 72，5B 槽；模板常量 2457399 与解码值逐字节吻合）——本场 1 手成交 ⇒ 1。
         Assert.Equal(1, tick.OpenInterest);
     }
+
+    /// <summary>
+    /// 量槽含标记字节时仍要原值到客户端（2026-10-25 事故回归）。
+    /// 成交量 224 = <c>00 00 E0</c>、卖一档量 226 = <c>00 E2</c>——旧版裸插 ⇒ 客户端按标记切字段
+    /// 错位 ⇒ native 侧无限重投同一笔 tick。改成 E0 转义后，官方 SDK 必须解回原值（帧长 +2B，
+    /// 由帧头声明，SDK 按长度读）。用 ax001（价位 99）而非 m2701：224 手保证金在 1M 余额内。
+    /// </summary>
+    [Fact]
+    public async Task 量槽含标记字节时客户端读回原值()
+    {
+        const string inst = "ax001";
+
+        // 单边挂 450 手卖；随后吃 224 手 ⇒ 成交量 224、卖一档剩 226，两个量槽同时命中标记字母表
+        _sim.Core.InsertOrder("mm", new Aether.Exchange.OrderRequest
+        {
+            BrokerId = FrontLoopback.Broker,
+            InvestorId = "mm",
+            InstrumentId = inst,
+            Direction = Aether.Exchange.Direction.Sell,
+            OffsetFlag = Aether.Exchange.OffsetFlag.Open,
+            PriceType = Aether.Exchange.OrderPriceType.Limit,
+            LimitPrice = 99,
+            Volume = 450,
+            TimeCondition = Aether.Exchange.TimeCondition.GFD,
+        });
+
+        var flowDir = Path.Combine(Path.GetTempPath(), "ctp-front-e2e", "mdesc", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(flowDir);
+        using var md = new CtpMarketData(flowDir);
+
+        var ticks = new ConcurrentBag<TickData>();
+        md.TickReceived += (_, t) => ticks.Add(t);
+
+        await md.LoginAsync(_sim.MdAddress, FrontLoopback.Broker, User, "m3-pass");
+        await md.SubscribeMarketDataAsync(new[] { inst });
+        await Task.Delay(300);   // 等订阅快照落地（快照 tick 的量为 0）
+
+        _sim.Core.InsertOrder("m3taker", new Aether.Exchange.OrderRequest
+        {
+            BrokerId = FrontLoopback.Broker,
+            InvestorId = "m3taker",
+            InstrumentId = inst,
+            Direction = Aether.Exchange.Direction.Buy,
+            OffsetFlag = Aether.Exchange.OffsetFlag.Open,
+            PriceType = Aether.Exchange.OrderPriceType.Market,
+            LimitPrice = 0,
+            Volume = 224,
+        });
+
+        var deadline = Environment.TickCount64 + 15000;
+        while (Environment.TickCount64 < deadline && !ticks.Any(t => Math.Abs(t.Volume - 224) < 1e-9))
+            await Task.Delay(50);
+
+        var tick = ticks.FirstOrDefault(t => Math.Abs(t.Volume - 224) < 1e-9);
+        Assert.NotNull(tick);
+        Assert.Equal(99, tick!.LastPrice);
+        Assert.Equal(226, tick.AskVolume);   // 450 − 224
+    }
 }
