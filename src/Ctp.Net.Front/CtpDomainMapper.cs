@@ -76,7 +76,7 @@ public static class CtpDomainMapper
 
     public static CtpInstrument ToCtpInstrument(Aether.Exchange.Instrument d) => new()
     {
-        InstrumentId = d.InstrumentId, ExchangeId = d.ExchangeId,
+        InstrumentId = d.InstrumentId, Name = d.Name, ExchangeId = d.ExchangeId,
         VolumeMultiple = d.VolumeMultiple, PriceTick = d.PriceTick,
         PreSettlement = d.PreSettlement, BasePrice = d.BasePrice,
     };

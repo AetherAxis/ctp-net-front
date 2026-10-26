@@ -30,7 +30,7 @@
 | 5 | `ReqSettlementInfoConfirm` | `E101E24013` | ⑪⑬ → 65B payload | 真前置逐字节一致（golden 测试） |
 | 6 | `ReqQryTradingAccount` | `E104E28006` | ⑮ 资金 → 134B payload | golden 测试 + 实值 999927.69 |
 | 7 | `ReqQryInvestorPosition` | `E104E28004` | ⑰ 持仓 → 逐仓一帧（多行已验证） | 真前置两合约两仓 ⇒ 两行 |
-| 8 | `ReqQryInstrument` | `E104E2802E` | 查合约 → 板子表 | 真前置 17335 行走二进制，客户端兼容 tag 逐行 |
+| 8 | `ReqQryInstrument` | `E104E2802E` | 查合约 → 板子表（**名称槽未接线**：④ 品种表 2026-10-26 起带 `Name`（ax001=Aether币价期货）且 RPC/③ `CtpInstrument.Name` 已透传到本仓 mapper——wire 应答帧补 GBK 定宽名称槽属 follow-up，坑参照 P1#6d 查交易所：槽宽错整行被 SDK 静默丢弃） | 真前置 17335 行走二进制，客户端兼容 tag 逐行 |
 | 9 | `ReqOrderInsert` | `E101E240E4` | ⑲ 报单（成功无应答 + RtnOrder 推送；风控拒单 ⑳ 两帧） | 真前置实下单 |
 | 10 | `ReqOrderAction` | `E101E24006` | ㉑ 撤单（**必须带 InstrumentID**，见 core DESIGN §5.1） | 真前置实撤成功 |
 | 11 | `ReqQryOrder` | `E104E280E4` | ⑯ 空表 13B tag 帧；非空**逐行 tag 记录帧**（442B 模板，2026-10-24 逆向完成） | 空表逐字节一致 + 单行/多行 E2E |
