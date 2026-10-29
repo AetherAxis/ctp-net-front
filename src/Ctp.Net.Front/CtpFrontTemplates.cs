@@ -937,10 +937,62 @@ internal static class CtpFrontTemplates
             new Edit(96, 25, RspInfo(25, errorId, errorMsg))
         );
 
-    // ===== M3 帧 MdSubscribeRsp（183B payload：订阅应答——捕获 verbatim，回显块边界见注释） =====
+    // ===== M3 帧 MdSubscribeRsp（183B payload：订阅应答——捕获 verbatim） =====
+    /// <summary>
+    /// 订阅应答抓包原文：帧头 + 4 条记录（m2701 / i2701 / ta2701 / IF2612）。
+    /// <b>只作为字节形状来源</b>——绝不再整段回放（见 <see cref="BuildMdSubscribeRsp"/>）。
+    /// 版式：0..30 = 帧头（含首条记录前的末字节 E9）；此后每 38B 一条记录，起点 31 / 69 / 107 / 145，
+    /// 记录内 E6 定宽 6B 合约槽落在 +27（抓包四条记录的槽偏移实测一致）。
+    /// </summary>
     internal static readonly byte[] MdSubscribeRspTemplate = H(
         "0103344CE44402E5050229E755E44354503A4E6F204572726F72EFEFEFEFE92441E17088B26E0BE170E270B16E0BE170E2B0B16E0BE170E201E66D32373031EFEFEFEFEFE12441E17088B26E0BE170E270B16E0BE170E2B0B16E0BE170E201E66932373031EFEFEFEFEFE12441E17088B26E0BE170E270B16E0BE170E2B0B16E0BE170E201E6746132373031EFEFEFEFEF2441E17088B26E0BE170E270B16E0BE170E2B0B16E0BE170E201E6494632363132EFEFEFEFEF"
     );
+
+    private const int MdSubRspFirstRecord = 31;   // 帧头宽度 = 首条记录起点
+    private const int MdSubRspRecordLen = 38;     // 单条记录宽度
+    private const int MdSubRspIdSlot = 27;        // 记录内 6B 合约槽（E6 定宽）
+
+    /// <summary>抓包 4 条记录的合约槽绝对偏移：31/69/107/145 + 27 = 58/96/134/172。</summary>
+    private static readonly int[] MdSubRspIdOffsets =
+        [0, 1, 2, 3].Select(k => MdSubRspFirstRecord + k * MdSubRspRecordLen + MdSubRspIdSlot).ToArray();
+
+    /// <summary>
+    /// 订阅应答：**按实际订阅集回填合约槽**，帧长保持抓包形状（183B），只改 4 个 6B 合约槽。
+    /// <para>
+    /// 2026-10-29 定案——旧版把 183B 抓包原样回放，等于每次订阅都向客户端宣告
+    /// m2701/i2701/ta2701/IF2612 四条「订阅成功」：桌面端日志冒出 4 条从没请求过的合约应答，
+    /// 而自己订阅的 ax001 一条应答都没有（E2E 里订阅的 m2701 恰好被抓包命中，才一直没暴露）。
+    /// </para>
+    /// <para>
+    /// <b>为什么不能按请求数裁剪记录</b>（2026-10-29 实测两次）：把记录裁成 N 条后，官方 SDK
+    /// 能解析出 N 条、isLast 也按位置判定正确，但**原生层会把同一帧无限重投**（2 条帧跑出 90 万次
+    /// OnRspSubMarketData 回调）——与本项目「单帧变形 ⇒ native 无限重投」的既有结论同根
+    /// （E4F101 快照 op、变宽 RspInfo 同族）。所以记录不动，只换槽内容：槽宽、长度、标记字节全不变。
+    /// </para>
+    /// <para>
+    /// 槽位按请求序列轮转填充（1 个合约 ⇒ 全部槽同名；2 个 ⇒ a,b,a,b），绝不多出对方没请求的合约。
+    /// 实测原生解析器按<b>槽内字符串长度</b>走记录边界：5 字符 ID 填进去时 183B 帧只走出 3 条回调
+    /// （末条 isLast=true）。数量无所谓——要紧的是名字全来自本次请求、且不重投。
+    /// </para>
+    /// </summary>
+    internal static byte[] BuildMdSubscribeRsp(IReadOnlyList<string> instruments)
+    {
+        if (instruments.Count == 0)
+            throw new ArgumentException("订阅应答至少要有一个合约（无合约时不回应答）", nameof(instruments));
+        var edits = new Edit[MdSubRspIdOffsets.Length];
+        for (var i = 0; i < edits.Length; i++)
+            edits[i] = new Edit(MdSubRspIdOffsets[i], 6, InstrumentSlot(instruments[i % instruments.Count]));
+        return Apply(MdSubscribeRspTemplate, edits);
+    }
+
+    /// <summary>6B 合约槽（E6 定宽）——抓包的填充字节是 <c>EF</c>（本编码的空），不是空格；
+    /// 超 6 字符按槽宽截断（与 broker/user 同一条等宽纪律）。</summary>
+    private static byte[] InstrumentSlot(string instrumentId)
+    {
+        var slot = Enumerable.Repeat((byte)0xEF, 6).ToArray();
+        A(instrumentId.Length > 6 ? instrumentId[..6] : instrumentId).CopyTo(slot, 0);
+        return slot;
+    }
 
     // ===== M3 帧 QryInstrumentRsp（421B payload：查合约 tag 应答——单行模板（InstrumentId/ExchangeId 等宽编辑；VolumeMultiple/PriceTick 等保留捕获 verbatim——板子只读 id/交易所） =====
     internal static readonly byte[] QryInstrumentRspTemplate = H(

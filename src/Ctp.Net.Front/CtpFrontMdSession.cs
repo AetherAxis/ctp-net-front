@@ -225,7 +225,9 @@ internal sealed class CtpFrontMdSession : IDisposable
             _log($"非预期帧（等订阅）: body前缀={HexPrefix(body)}");
             return null;
         }
-        // 解析合约集（严格合约形状 run——与交易腿 ⑲ 同款规则）并增量登记
+        // 解析合约集（严格合约形状 run——与交易腿 ⑲ 同款规则）并增量登记。
+        // requested = 本帧请求的全部合约（应答就按它逐条回显）；added = 其中的新合约（才去取快照/激活）。
+        var requested = new List<string>();
         var added = new List<string>();
         for (var i = 0; i < body.Length; i++)
         {
@@ -240,13 +242,19 @@ internal sealed class CtpFrontMdSession : IDisposable
             if (j > i + 1 && IsInstrumentRun(body[(i + 1)..j]))
             {
                 var inst = Encoding.ASCII.GetString(body[(i + 1)..j]);
+                if (!requested.Contains(inst)) requested.Add(inst);
                 if (_subscribed.Add(inst)) added.Add(inst);
             }
             i = j - 1;
         }
-        _log($"订阅: +[{string.Join(",", added)}] → 共 {_subscribed.Count} 个");
+        _log($"订阅: 请求[{string.Join(",", requested)}] 新增[{string.Join(",", added)}] → 共 {_subscribed.Count} 个");
+        if (requested.Count == 0)
+        {
+            _log("订阅帧里没有可识别合约——不回应答（旧版回抓包模板，等于凭空宣告 4 个别人的合约）");
+            return null;
+        }
         if (added.Count == 0)
-            return BuildFrame(CtpFrontTemplates.MdSubscribeRspTemplate);
+            return BuildFrame(CtpFrontTemplates.BuildMdSubscribeRsp(requested));
 
         // 快照经 `quotes` op 应答取（进程内版 = Market.GetQuote 直调）；订阅经 `subscribe` op（服务端
         // 激活行情——订阅即激活）。先取快照再订阅：快照走应答通道，与订阅 op 的激活快照推送（如有）不冲突
@@ -257,7 +265,7 @@ internal sealed class CtpFrontMdSession : IDisposable
         // 订阅应答 + 当前快照 tick **同一次 TCP 写**（真实前置行为——v2 抓包 664B = 195B rsp + 461B tick
         // 拼一个写；M0 = rsp + 12B 迷你帧同写）。单独推送 E4F101 会触发 native 无限重投（E2E 7 种
         // 帧形状实证）——「紧跟 rsp 同写」是唯一未测且与抓包完全一致的形状。快照来自 op 应答 ⇒ 形状不变。
-        var parts = new List<byte[]> { BuildFrame(CtpFrontTemplates.MdSubscribeRspTemplate) };
+        var parts = new List<byte[]> { BuildFrame(CtpFrontTemplates.BuildMdSubscribeRsp(requested)) };
         foreach (var q in snap.Quotes ?? new List<MarketQuote>())
         {
             // 快照通道的 MarketQuote 无成交量字段（⑥ RPC 契约）——订阅首帧先给 0，随后的流式 tick 带真实量。

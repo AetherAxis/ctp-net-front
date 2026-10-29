@@ -33,15 +33,17 @@ public sealed class CtpFrontE2eM3Tests : IDisposable
         await md.LoginAsync(_sim.MdAddress, FrontLoopback.Broker, User, "m3-pass");
         // LoginAsync 无异常返回 = 登录应答帧被 SDK 接受（MdLoginRsp 模板通过裁判）
 
-        // ② 订阅 m2701 + 订阅应答（SDK 即裁判：订阅应答帧被官方 SDK 接受并触发 4 个
-        // OnRspSubMarketData 回调——含 m2701 的成功确认）
+        // ② 订阅 m2701 + 订阅应答（SDK 即裁判：订阅应答帧被官方 SDK 接受并逐合约触发
+        // OnRspSubMarketData——**只有**本帧请求的那一个合约，末条 isLast=true）
         var subAcks = new ConcurrentBag<(string Inst, int Err, string Msg, bool Last)>();
         md.SubMarketDataResult += (_, e) => subAcks.Add((e.InstrumentId, e.ErrorId, e.ErrorMsg, e.IsLast));
         await md.SubscribeMarketDataAsync(new[] { Instrument });
         var deadline = Environment.TickCount64 + 15000;
-        while (Environment.TickCount64 < deadline && subAcks.Count == 0)
+        while (Environment.TickCount64 < deadline && !subAcks.Any(a => a.Last))
             await Task.Delay(50);
-        Assert.Contains(subAcks, a => a.Inst == Instrument && a.Err == 0);
+        Assert.Equal(new[] { Instrument }, subAcks.Select(a => a.Inst).Distinct().ToArray());
+        Assert.Contains(subAcks, a => a.Inst == Instrument && a.Err == 0 && a.Last);
+        Assert.InRange(subAcks.Count, 1, 8);    // 无重投（无限重投时是几十万条）
 
         // ③ 成交驱动一帧 tick（E4F103 流式 op——SDK 即裁判：值/合约/时间逐字段断言）：
         // taker 市价买 1 吃 maker 卖侧 ⇒ last=3001，簿顶 bid=2999 / ask=3001（卖侧剩 19）
@@ -96,6 +98,40 @@ public sealed class CtpFrontE2eM3Tests : IDisposable
         Assert.Equal(19, tick.AskVolume);
         // 持仓量（offset 72，5B 槽；模板常量 2457399 与解码值逐字节吻合）——本场 1 手成交 ⇒ 1。
         Assert.Equal(1, tick.OpenInterest);
+    }
+
+    /// <summary>
+    /// 订阅应答只回显本次请求的合约（2026-10-29 回归）。
+    /// 旧版把 183B 抓包整段回放 ⇒ 无论订阅什么，客户端都收到 m2701/i2701/ta2701/IF2612 四条
+    /// 「订阅成功」，而自己订阅的品种（如 ax001）一条应答都没有——自定义品种被灌了别人的订阅回执。
+    /// 记录数不能裁剪（裁剪成 N 条会让 native 无限重投，见 BuildMdSubscribeRsp 注释），
+    /// 所以这里断言的是「应答里的合约名**只有**本次请求的、且不重投」。
+    /// </summary>
+    [Fact]
+    public async Task 订阅应答只回显请求的合约()
+    {
+        var flowDir = Path.Combine(Path.GetTempPath(), "ctp-front-e2e", "mdsub", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(flowDir);
+        using var md = new CtpMarketData(flowDir);
+
+        var acks = new ConcurrentBag<(string Inst, int Err, string Msg, bool Last)>();
+        md.SubMarketDataResult += (_, e) => acks.Add((e.InstrumentId, e.ErrorId, e.ErrorMsg, e.IsLast));
+
+        await md.LoginAsync(_sim.MdAddress, FrontLoopback.Broker, User, "m3-pass");
+        await md.SubscribeMarketDataAsync(new[] { "m2701", "ax001" });
+
+        var deadline = Environment.TickCount64 + 15000;
+        while (Environment.TickCount64 < deadline && !acks.Any(a => a.Last))
+            await Task.Delay(50);
+
+        // 合约名只能来自本次请求（旧版这里是 m2701/i2701/ta2701/IF2612 混着来）
+        Assert.Equal(new[] { "ax001", "m2701" },
+            acks.Select(a => a.Inst).Distinct().OrderBy(x => x, StringComparer.Ordinal).ToArray());
+        Assert.All(acks, a => Assert.Equal(0, a.Err));
+        Assert.Equal(1, acks.Count(a => a.Last));                // 末条且仅末条 isLast=true
+        // 记录数不再钉死 4：把 6 字符槽写成 5 字符 ID 后原生解析器只走出 3 条（实测），
+        // 关键是**没有重投**——无限重投时这里会是几十万条。
+        Assert.InRange(acks.Count, 1, 8);
     }
 
     /// <summary>
