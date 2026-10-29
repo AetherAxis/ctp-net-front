@@ -954,7 +954,7 @@ internal static class CtpFrontTemplates
 
     /// <summary>抓包 4 条记录的合约槽绝对偏移：31/69/107/145 + 27 = 58/96/134/172。</summary>
     private static readonly int[] MdSubRspIdOffsets =
-        [0, 1, 2, 3].Select(k => MdSubRspFirstRecord + k * MdSubRspRecordLen + MdSubRspIdSlot).ToArray();
+        new[] { 0, 1, 2, 3 }.Select(k => MdSubRspFirstRecord + k * MdSubRspRecordLen + MdSubRspIdSlot).ToArray();
 
     /// <summary>
     /// 订阅应答：**按实际订阅集回填合约槽**，帧长保持抓包形状（183B），只改 4 个 6B 合约槽。
