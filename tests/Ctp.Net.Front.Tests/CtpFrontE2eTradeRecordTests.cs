@@ -23,6 +23,7 @@ public sealed class CtpFrontE2eTradeRecordTests : IDisposable
         var dir = Path.Combine(Path.GetTempPath(), "ctp-front-e2e", "qrytrade", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         var trader = new CtpTrader(dir);
+        _sim.Deposit(User);   // 开户余额恒 0 ⇒ 参与者先显式入金（链上充值替身）
         await trader.LoginAsync(new CtpConnectRequest
         {
             FrontAddress = _sim.FrontAddress,

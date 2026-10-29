@@ -23,6 +23,7 @@ public sealed class QueryOrderStallReproTests : IDisposable
     private CtpTrader Login(string flowDir)
     {
         var trader = new CtpTrader(flowDir);
+        _sim.Deposit(User);   // 开户余额恒 0 ⇒ 参与者先显式入金（链上充值替身）
         var login = trader.LoginAsync(new CtpConnectRequest
         {
             FrontAddress = _sim.FrontAddress,

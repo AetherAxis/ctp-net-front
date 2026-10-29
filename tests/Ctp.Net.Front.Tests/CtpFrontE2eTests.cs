@@ -48,6 +48,8 @@ public sealed class CtpFrontE2eTests : IDisposable
         Directory.CreateDirectory(flowDir);
         using var trader = new CtpTrader(flowDir);
 
+        _sim.Deposit(User6);   // 开户余额恒 0 ⇒ 显式充值（链上 AQ 转账的替身）
+
         // 登录（SDK 内部：⑤认证→⑦登录→⑧预响应→⑨系统信息→⑩登录结果→⑪自动结算确认）
         var login = await trader.LoginAsync(Connect(_sim, User6, "e2e-pass"));
         Assert.Equal("20260923", login.TradingDay);
@@ -58,10 +60,10 @@ public sealed class CtpFrontE2eTests : IDisposable
         await trader.ConfirmSettlementAsync(FrontLoopback.Broker, User6);
 
         // 资金查询（⑮→⑯：六个余额字段全 ← Balance，E0 转义大端 double——tag 字母表字节前插 E0；
-        // 首登开户 = InitialBalance）
+        // 值 = 上面那笔显式充值——开户本身是 0，平台没有任何赠金）
         var account = await trader.QueryTradingAccountAsync(FrontLoopback.Broker, User6);
         Assert.Equal(User6, account.AccountId);
-        Assert.Equal(FrontLoopback.InitialBalance, account.Balance);
+        Assert.Equal(FrontLoopback.SandboxDeposit, account.Balance);
 
         // 持仓查询（⑰→⑱：空表——新账户无持仓）。
         // 真实前置的空表行为（SDK 即裁判实证）：⑱ 是真 SimNow 对无持仓账户的原样应答，
@@ -105,6 +107,8 @@ public sealed class CtpFrontE2eTests : IDisposable
         Directory.CreateDirectory(flowDir);
         using var trader = new CtpTrader(flowDir);
 
+        _sim.Deposit("tst1");   // 开户余额恒 0 ⇒ 显式充值（链上 AQ 转账的替身）
+
         var login = await trader.LoginAsync(new CtpConnectRequest
         {
             FrontAddress = _sim.FrontAddress,
@@ -120,7 +124,7 @@ public sealed class CtpFrontE2eTests : IDisposable
         await trader.ConfirmSettlementAsync(FrontLoopback.Broker, "tst1");
 
         var account = await trader.QueryTradingAccountAsync(FrontLoopback.Broker, "tst1");
-        Assert.Equal(FrontLoopback.InitialBalance, account.Balance);
+        Assert.Equal(FrontLoopback.SandboxDeposit, account.Balance);
 
         var positions = await trader.QueryInvestorPositionAsync(FrontLoopback.Broker, "tst1");
         Assert.DoesNotContain(positions, p => p.TotalPosition != 0 || p.TodayPosition != 0 || p.YdPosition != 0);
@@ -130,7 +134,7 @@ public sealed class CtpFrontE2eTests : IDisposable
     /// 非 6 字符用户：客户端 SDK 把 <b>⑦ 登录帧的 user 序列化成定长 6 字节槽</b>（2026-10-12 服务器实测踩中：
     /// botmm(5)→"botmm "补空格、botnoise(8)→"botnoi"截断 ⇒ 前置绑定被污染的账户名 ⇒ 连到 0 余额幽灵户，
     /// 真身 300 万永远查不到）。修复 = <b>绑定账户名以 ⑤ 认证帧的变长完整 user 为准</b>（⑦ 的解析结果丢弃）。
-    /// 分辨手段 = 资金差：真身充 7 AQ（Balance=1000007）；错绑幽灵户 = 首登开户 1000000。
+    /// 分辨手段 = 资金差：真身充 100 万 + 7 AQ（Balance=1000007）；错绑幽灵户 = 0（开户不赠金）。
     /// </summary>
     [Theory]
     [InlineData("botmm")]      // 5 字符——⑦ 定长槽补空格场景
@@ -141,7 +145,8 @@ public sealed class CtpFrontE2eTests : IDisposable
         Directory.CreateDirectory(flowDir);
         using var trader = new CtpTrader(flowDir);
 
-        _sim.Core.CreditQuoteDeposit(user, 700_000_000);   // 真身 +7 AQ（1 AQ = 1 现金）
+        _sim.Deposit(user);                                // 真身：先入 1,000,000（链上充值替身）
+        _sim.Core.CreditQuoteDeposit(user, 700_000_000);   // 再加 7 AQ（1 AQ = 1 现金）
 
         var login = await trader.LoginAsync(Connect(_sim, user, "e2e-pass"));
         Assert.Equal("20260923", login.TradingDay);
@@ -149,6 +154,6 @@ public sealed class CtpFrontE2eTests : IDisposable
         await trader.ConfirmSettlementAsync(FrontLoopback.Broker, user);
 
         var account = await trader.QueryTradingAccountAsync(FrontLoopback.Broker, user);
-        Assert.Equal(1_000_007, account.Balance, 2);   // 绑定真身（错绑幽灵 = 1000000）
+        Assert.Equal(1_000_007, account.Balance, 2);   // 绑定真身（错绑幽灵户 = 0——没有赠金）
     }
 }

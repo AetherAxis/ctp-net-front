@@ -25,6 +25,7 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
 
     private CtpTrader Login(string flowDir)
     {
+        _sim.Deposit(User);   // 开户余额恒 0 ⇒ 参与者先显式入金（链上充值替身）
         var trader = new CtpTrader(flowDir);
         var login = trader.LoginAsync(new CtpConnectRequest
         {
@@ -101,7 +102,7 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
         var coreRest = _sim.Core.QueryOrders(SimTradingCore.AccountIdOf(User)).Single(o => o.OrderRef == rest.OrderRef);
         Assert.True((char)coreRest.OrderStatusRaw == '5' && coreRest.VolumeTotal == 0, "核心侧撤单未收敛");
         var acct = _sim.Core.QueryAccount(SimTradingCore.AccountIdOf(User));
-        Assert.True(acct.Available > FrontLoopback.InitialBalance - 5000, $"撤单后冻结未释放: Available={acct.Available}");   // 成交保证金~3000+手续费+浮亏 ≈3000，远小于 5000
+        Assert.True(acct.Available > FrontLoopback.SandboxDeposit - 5000, $"撤单后冻结未释放: Available={acct.Available}");   // 成交保证金~3000+手续费+浮亏 ≈3000，远小于 5000
 
         // ④ 核心侧闭环：成交后持仓 1 手多（OrderRef 直通——核心账本按客户端号记账）
         var positions = _sim.Core.QueryPositions(SimTradingCore.AccountIdOf(User));
@@ -226,12 +227,12 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
         var acct = _sim.Core.QueryAccount(SimTradingCore.AccountIdOf(User));
         var deadline = Environment.TickCount64 + 5000;
         while (Environment.TickCount64 < deadline
-               && (acct.FrozenMargin != 0 || acct.Available != FrontLoopback.InitialBalance))
+               && (acct.FrozenMargin != 0 || acct.Available != FrontLoopback.SandboxDeposit))
         {
             await Task.Delay(50);   // ⑲ fire-and-forget：等核心侧拒单落账再断言（旧版靠解析失败静默丢单才「恰好」通过）
             acct = _sim.Core.QueryAccount(SimTradingCore.AccountIdOf(User));
         }
-        Assert.True(acct.FrozenMargin == 0 && acct.Available == FrontLoopback.InitialBalance, "核心未拒单（资金被冻结）");
+        Assert.True(acct.FrozenMargin == 0 && acct.Available == FrontLoopback.SandboxDeposit, "核心未拒单（资金被冻结）");
     }
 
     [Fact]
@@ -261,7 +262,7 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
         var coreOrder = _sim.Core.QueryOrders(SimTradingCore.AccountIdOf(User)).Single(o => o.OrderRef == ioc.OrderRef);
         Assert.True((char)coreOrder.OrderStatusRaw == '4' && coreOrder.VolumeTotal == 0, $"核心侧 IOC 残量未作废: {coreOrder}");
         var acct = _sim.Core.QueryAccount(SimTradingCore.AccountIdOf(User));
-        Assert.True(acct.FrozenMargin == 0 && acct.Available == FrontLoopback.InitialBalance,
+        Assert.True(acct.FrozenMargin == 0 && acct.Available == FrontLoopback.SandboxDeposit,
             $"IOC 作废后冻结未释放: FrozenMargin={acct.FrozenMargin} Available={acct.Available}");
     }
 
@@ -309,7 +310,7 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
         Assert.True(await UntilAsync(() => _sim.Core.QueryOrders(SimTradingCore.AccountIdOf(User))
             .Any(o => o.OrderRef == rest.OrderRef && (char)o.OrderStatusRaw == '5')), "post-only 撤单 '5' 终态未到达");
         var acct = _sim.Core.QueryAccount(SimTradingCore.AccountIdOf(User));
-        Assert.True(acct.FrozenMargin == 0 && acct.Available == FrontLoopback.InitialBalance,
+        Assert.True(acct.FrozenMargin == 0 && acct.Available == FrontLoopback.SandboxDeposit,
             $"post-only 撤单后冻结未释放: FrozenMargin={acct.FrozenMargin} Available={acct.Available}");
     }
 
@@ -388,10 +389,10 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
         using var trader = Login(dir);
 
         var first = await trader.QueryTradingAccountAsync(FrontLoopback.Broker, User, CancellationToken.None);
-        Assert.Equal(FrontLoopback.InitialBalance, first.Balance);
+        Assert.Equal(FrontLoopback.SandboxDeposit, first.Balance);
         // 第二次同型查询——修复前这里 30s 超时（实例重复被丢）
         var second = await trader.QueryTradingAccountAsync(FrontLoopback.Broker, User, CancellationToken.None);
-        Assert.Equal(FrontLoopback.InitialBalance, second.Balance);
+        Assert.Equal(FrontLoopback.SandboxDeposit, second.Balance);
         // 第三次跨型查询（⑰ 空表——实例计数继续推进）
         var positions = await trader.QueryInvestorPositionAsync(FrontLoopback.Broker, User, ct: CancellationToken.None);
         Assert.NotNull(positions);
@@ -403,7 +404,7 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
         catch (TimeoutException) { /* 已知边界：tag 空应答 SDK 不派发 */ }
         // 之后的查询仍健康？（若这里也超时 ⇒ 未决查询堵死管线 ⇒ 必须在服务端彻底解决查报单）
         var third = await trader.QueryTradingAccountAsync(FrontLoopback.Broker, User, CancellationToken.None);
-        Assert.Equal(FrontLoopback.InitialBalance, third.Balance);
+        Assert.Equal(FrontLoopback.SandboxDeposit, third.Balance);
     }
 
     [Fact]
@@ -435,6 +436,7 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
 
     private static CtpTrader LoginAccount(FrontLoopback sim, string user)
     {
+        sim.Deposit(user);   // 开户余额恒 0 ⇒ 参与者先显式入金（链上充值替身）
         var dir = Path.Combine(Path.GetTempPath(), "ctp-front-e2e", $"dual-{user}", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         var trader = new CtpTrader(dir);

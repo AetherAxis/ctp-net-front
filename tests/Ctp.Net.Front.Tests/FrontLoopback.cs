@@ -16,7 +16,31 @@ namespace Ctp.Net.Front.Tests;
 public sealed class FrontLoopback : IDisposable
 {
     public const string Broker = "9999";
-    public const double InitialBalance = 1_000_000;
+    /// <summary>
+    /// 沙盒入金量：测试侧**显式充值**（<see cref="Deposit"/>）的默认数额。平台没有「开户赠金」——
+    /// 新账户首登开户余额恒 0，场内现金只能由 <c>CreditQuoteDeposit</c>（链上 AQ 充值对账）进来；
+    /// 这里就是那笔「链上 AQ 真实转账」在 E2E 里的替身。
+    /// </summary>
+    public const double SandboxDeposit = 1_000_000;
+
+    /// <summary>
+    /// 回环里作为参与者下单的沙盒账户（做市/对手盘）：启动时各入一笔（链上充值替身）。
+    /// 其余账户（各用例自己的 CTP 用户）由用例经 <see cref="Deposit"/> 显式入金。
+    /// </summary>
+    public static readonly string[] SandboxAccounts = ["mm", "mm2", "mm3", "m3taker"];
+
+    /// <summary>本实例上已入过金的账户（<see cref="Deposit"/> 幂等：重复调用是空操作）。</summary>
+    private readonly HashSet<string> _funded = new(StringComparer.Ordinal);
+
+    /// <summary>给账户入金（唯一入金通道 <c>CreditQuoteDeposit</c>；1 AQ = 1 现金）。</summary>
+    public void Deposit(string accountId, double tokens = SandboxDeposit)
+    {
+        lock (_funded)
+        {
+            if (!_funded.Add(accountId)) return;
+            Core.CreditQuoteDeposit(accountId, (ulong)(tokens * SimTradingCore.QuoteAtomsPerToken));
+        }
+    }
 
     /// <summary>确定性时钟：2026-09-23 周三 10:00（日盘）⇒ <c>TradingDay == "20260923"</c>。</summary>
     public static readonly DateTime TradingNow = new(2026, 9, 23, 10, 0, 0);
@@ -43,6 +67,7 @@ public sealed class FrontLoopback : IDisposable
     private FrontLoopback(SimTradingCore core, SimRpcServer exchange, CtpFrontServer server, string frontAddress, string logPath, CtpFrontMdServer mdServer, string mdAddress)
     {
         Core = core;
+        foreach (var account in SandboxAccounts) _funded.Add(account);   // 启动已入金 ⇒ Deposit 再调是空操作
         Exchange = exchange;
         Server = server;
         FrontAddress = frontAddress;
@@ -57,6 +82,7 @@ public sealed class FrontLoopback : IDisposable
     /// </summary>
     public void SeedMaker(int volumePerSide = 20)
     {
+        Deposit("mm");   // 双边挂单要冻结保证金（开户余额恒 0 ⇒ 先入金，= maker 自己的一笔 AQ 充值）
         Core.InsertOrder("mm", MakerOrder(Direction.Buy, volumePerSide, 2999));
         Core.InsertOrder("mm", MakerOrder(Direction.Sell, volumePerSide, 3001));
     }
@@ -81,10 +107,12 @@ public sealed class FrontLoopback : IDisposable
             DatabasePath = null,    // 纯内存——绝不碰 ~/.aether/ctp-sim.db（用户真实账本）
             // 上市表双品种：查合约多行钉子（wrapper 静默期收尾，2026-10-05——两行都应到达 SDK）；m2701 = 交易腿测试合约
             ListedInstruments = new[] { "ax001", Instrument },
-            InitialBalance = InitialBalance,   // 沙盒水龙头显式开（平台默认已改 0）
         };
         var core = new SimTradingCore(options, new SimClock(() => TradingNow));
         core.InitializeAsync().GetAwaiter().GetResult(); // xunit 无同步上下文，安全
+        // 开户余额恒 0（平台没有赠金）⇒ 沙盒参与者先各入一笔（等价「各自转了 AQ 进来」）
+        foreach (var account in SandboxAccounts)
+            core.CreditQuoteDeposit(account, (ulong)(SandboxDeposit * SimTradingCore.QuoteAtomsPerToken));
 
         // 进程分离形态（2026-10-05 真实世界对齐）：交易所（core + SimRpcServer）与前置（CTP 线协议双腿）
         // 经真实 loopback TCP 相连——前置每客户端会话一条交易所 RPC 连接。E2E 跑的即分离架构本身

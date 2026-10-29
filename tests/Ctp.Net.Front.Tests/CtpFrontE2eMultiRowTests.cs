@@ -23,7 +23,8 @@ public sealed class CtpFrontE2eMultiRowTests : IDisposable
     public async Task 持仓查询_两个合约各一仓_两行全部到达()
     {
         // ① 两个合约都要有 maker 流动性（价格发现归簿：没有挂单就没有成交，没有成交就没有持仓）
-        _sim.SeedMaker();                                   // m2701：买 20@2999 / 卖 20@3001
+        _sim.SeedMaker();                                   // m2701：买 20@2999 / 卖 20@3001（内含 mm 入金）
+        _sim.Deposit(User);
         SeedMaker(Other, 2998, 3000);
 
         // ② 同一账户在两个合约上各吃 1 手 ⇒ 两条持仓

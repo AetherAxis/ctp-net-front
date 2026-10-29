@@ -24,6 +24,7 @@ public sealed class CtpFrontE2eOrderQueryTests : IDisposable
         var dir = Path.Combine(Path.GetTempPath(), "ctp-front-e2e", "qryorder", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         var trader = new CtpTrader(dir);
+        _sim.Deposit(User);   // 开户余额恒 0 ⇒ 参与者先显式入金（链上充值替身）
         await trader.LoginAsync(new CtpConnectRequest
         {
             FrontAddress = _sim.FrontAddress,
@@ -47,7 +48,7 @@ public sealed class CtpFrontE2eOrderQueryTests : IDisposable
     [Fact]
     public async Task 查报单_一张挂单_回一行且字段与下单一致()
     {
-        _sim.SeedMaker();                                     // m2701：买 20@2999 / 卖 20@3001
+        _sim.SeedMaker();                                     // m2701：买 20@2999 / 卖 20@3001（内含 mm 入金）
         using var trader = await LoginAsync();
         var rest = await RestAsync(trader, FrontLoopback.Instrument, 2900, 3);   // <maker Bid ⇒ 挂住
 

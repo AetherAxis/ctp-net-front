@@ -20,7 +20,7 @@ public sealed class CtpFrontE2eM3Tests : IDisposable
     public async Task 行情腿_Md登录_订阅_Tick推送全链路()
     {
         // maker 双边挂单（价格发现归簿——tick 事件驱动：订阅快照 + 成交推送，无注价入口）
-        _sim.SeedMaker();
+        _sim.SeedMaker();          // 内含 mm 入金
 
         var flowDir = Path.Combine(Path.GetTempPath(), "ctp-front-e2e", "md", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(flowDir);
