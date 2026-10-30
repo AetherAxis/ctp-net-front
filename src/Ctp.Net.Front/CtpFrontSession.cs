@@ -74,6 +74,15 @@ internal sealed class CtpFrontSession : IDisposable
     //    跨 await 保持 true）推送先入捕获缓冲，应答帧入队后同锁排空——「应答先于推送」（消费方在应答后
     //    才注册 OrderRef，先到的回报会被丢）。RPC 侧服务端另有同款捕获保证应答帧先写 wire（F1 顺序契约）。——
     private readonly Channel<byte[]> _out = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
+
+    /// <summary>
+    /// 出站队列的**自记账深度**（2026-10-30）。为什么不用 <c>_out.Reader.Count</c>：本运行时的
+    /// <see cref="ChannelReader{T}.Count"/> 对 unbounded channel 直接抛 <c>NotSupportedException</c>
+    /// （"Specified method is not supported."），实测把写循环直接打死。自记账只依赖 TryWrite 成功与否：
+    /// 入队前 +1、写完后 -1 —— 因为先加后写，写循环再快也不会读到负数。
+    /// 目前只有「F0 序号安全点」用它判断出站是否排空。
+    /// </summary>
+    private int _outPending;
     private readonly object _writeGate = new();
     private readonly List<byte[]> _captured = new();
     private volatile bool _dispatching;
@@ -112,7 +121,7 @@ internal sealed class CtpFrontSession : IDisposable
                     // （host 照常收答、客户端全超时无断线事件）——bot 长连接必死。
                     if (frame.IsHeartbeat)
                     {
-                        _out.Writer.TryWrite(CtpFrame.Heartbeat);
+                        EnqueueOutbound(CtpFrame.Heartbeat);
                         continue;
                     }
                     await DispatchFrameAsync(frame, ct);
@@ -148,6 +157,9 @@ internal sealed class CtpFrontSession : IDisposable
                 // 出站帧也记日志——诊断「SDK 收到坏响应后挂死」时需要看见我们到底发了什么字节
                 _log($"[CTP-Front] → [{frame.Length}B] {Convert.ToHexString(frame)}");
                 await stream.WriteAsync(frame, ct);
+                Interlocked.Decrement(ref _outPending);
+                // 这一帧真的出去了：若已过序号软点且队列已空，这里就是安全点（open-issues #2）
+                TryRecycleAtSafePoint();
             }
         }
         catch (OperationCanceledException) { }
@@ -184,9 +196,9 @@ internal sealed class CtpFrontSession : IDisposable
             lock (_writeGate)
             {
                 if (response is { Length: > 0 })
-                    _out.Writer.TryWrite(response);
+                    EnqueueOutbound(response);
                 foreach (var captured in _captured)
-                    _out.Writer.TryWrite(captured);
+                    EnqueueOutbound(captured);
                 _captured.Clear();
                 _dispatching = false;
             }
@@ -201,12 +213,29 @@ internal sealed class CtpFrontSession : IDisposable
     /// 回卷形态均被拒收（2026-10-19 F0 族 E2E 实证；224-239 转义对/240-251 裸值可过）。序号是 SDK 侧
     /// 底层限制，服务器端无法扩域——临界限即主动断开客户端连接（SDK 自动重连、新会话序号归零，
     /// 客户端零改动）。240 = 251 减余量。相关：被 5c6f9ff 退役的客户端 220 规避重连实质是在兜同一
-    /// 限制（应答族 int 化只救了 80 族，救不了 F0 推送族）。</summary>
-    private bool _rtnRecycleDue;
+    /// 限制（应答族 int 化只救了 80 族，救不了 F0 推送族）。
+    /// <para>
+    /// <b>2026-10-30：断开挪到「安全点」（open-issues #2）</b>。旧版在入队那一刻立刻 <c>Close</c>——
+    /// 断口正好落在报单/成交推送的突发中间：客户端已经发出去的报单可能刚被受理，回报却断在链条上
+    /// （后果靠登录对账兜住，但每次 240 都要对一遍账）。现在拆成：
+    /// <list type="number">
+    /// <item><b>软点 240</b>：只打标（<see cref="_rtnRecycleDue"/>），不立刻断。</item>
+    /// <item><b>安全点</b>：出站队列排空 + 没有正在分发的应答（<c>_dispatching</c>/<c>_captured</c> 皆空）
+    /// 时才 <c>Close</c>——保证已生成的每一帧都已写出。</item>
+    /// <item><b>硬顶 251</b>：SDK 可接受上界。到这一步不再等安全点，立刻断，且该帧<b>不入队</b>
+    /// （>251 的序号会让客户端拒收整条流，写出去比丢掉更糟）。</item>
+    /// </list>
+    /// 软点与硬顶之间留 11 个号的余量，就是给「等队列排空」用的。
+    /// </para>
+    /// </summary>
+    private int _rtnRecycleDue;   // 1 = 已过软点、待安全点回收；Interlocked 交换一次即消费
+    private const int RtnSoftLimit = 240;
+    private const int RtnHardLimit = 251;
+
     private int NextRtnInstance()
     {
         var n = ++_rtnInstanceInt;
-        if (n >= 240) _rtnRecycleDue = true;
+        if (n >= RtnSoftLimit) Interlocked.Exchange(ref _rtnRecycleDue, 1);
         return n;
     }
 
@@ -418,22 +447,51 @@ internal sealed class CtpFrontSession : IDisposable
     /// <summary>主动推送入站（core 事件 → wire 帧）。分发期间入捕获缓冲（应答先于推送），否则直写队列。</summary>
     private void RoutePush(byte[] frame)
     {
+        // 硬顶：序号已越过 SDK 可接受上界，这一帧**不入队**（写出去会让客户端拒收整条流），直接断。
+        if (Volatile.Read(ref _rtnInstanceInt) > RtnHardLimit && TryBeginRecycle())
+        {
+            _log($"[CTP-Front] F0 推送序号越过硬顶 {RtnHardLimit}——立即断开（该帧丢弃，客户端重连后重查自愈）");
+            try { _client.Close(); } catch { }
+            return;
+        }
+
         lock (_writeGate)
         {
             if (_dispatching)
                 _captured.Add(frame);
             else
-                _out.Writer.TryWrite(frame);
+                EnqueueOutbound(frame);
         }
-        // F0 族序号临界限（240）：本帧入队后主动断开——客户端 SDK 自动重连开新会话（序号归零）。
-        // 在 lock 外执行（Close 触发读循环退出 → finally 清理链安全）；最后一帧已在出站队列（写循环
-        // 先于 Close 生效的概率高，即便丢弃客户端重连后重查自愈）。
-        if (_rtnRecycleDue && _state != State.Closed)
+        // 软点之后只有「出站排空」才回收——见 TryRecycleAtSafePoint 的注释。
+        TryRecycleAtSafePoint();
+    }
+
+    /// <summary>
+    /// 安全点回收（open-issues #2）：软点已达 **且** 出站队列为空 **且** 没有正在生成的应答/推送，
+    /// 才主动断开。调用点有两处——<see cref="RoutePush"/> 入队后、以及写循环每写完一帧后
+    /// （后者才是「最后一帧真的写到 socket 上了」的那一刻）。
+    /// </summary>
+    private void TryRecycleAtSafePoint()
+    {
+        if (Volatile.Read(ref _rtnRecycleDue) == 0 || _state == State.Closed) return;
+        if (Volatile.Read(ref _outPending) > 0) return;          // 出站还有帧：等写完
+        lock (_writeGate)
         {
-            _rtnRecycleDue = false;
-            _log("[CTP-Front] F0 推送序号达 240 上限——主动断开客户端（SDK 自动重连、序号归零）");
-            try { _client.Close(); } catch { }
+            if (_dispatching || _captured.Count > 0) return;     // 应答/推送还在生成
         }
+        if (!TryBeginRecycle()) return;                          // 已被另一条线程消费
+        _log($"[CTP-Front] F0 推送序号达安全点（已过 {RtnSoftLimit}，出站已排空）——主动断开客户端（SDK 自动重连、序号归零）");
+        try { _client.Close(); } catch { }
+    }
+
+    /// <summary>消费「待回收」标记：多线程同时想断时只有一个真的断开。</summary>
+    private bool TryBeginRecycle() => Interlocked.Exchange(ref _rtnRecycleDue, 0) != 0;
+
+    /// <summary>出站入队的唯一入口（维持 <see cref="_outPending"/> 与队列一致）。</summary>
+    private void EnqueueOutbound(byte[] frame)
+    {
+        Interlocked.Increment(ref _outPending);
+        if (!_out.Writer.TryWrite(frame)) Interlocked.Decrement(ref _outPending);
     }
 
     /// <summary>处理一个入站帧，返回应答帧（null = 无应答）。业务分支含 RPC await（交易所跨进程）。</summary>

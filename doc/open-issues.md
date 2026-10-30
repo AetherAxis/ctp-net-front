@@ -6,17 +6,17 @@
 > 上一轮（2026-10-29）已修 10 项，见各仓 DESIGN 的升级记录：`DESIGN.md` §3.8–§3.10、
 > `../../ctp-net-core/DESIGN.md` §5.5、`../../ctp-net-client/DESIGN.md` §8。
 >
-> 验证基线：`ctp-net-front` 101 例全绿（11m27s）、`ctp-net-client` 25 例全绿；
-> `ctp-net-core` **没有测试工程**，改动靠前置 E2E 间接覆盖。
+> 验证基线（2026-10-30 复核）：`ctp-net-front` **115 例**全绿（11m31s；+14 分帧/编解码单测）、`ctp-net-client` **52 例**全绿（+27：状态机 20 + OrderRef 存储 7）、
+> `ctp-net-core` **新增 15 例**（reqId 分配器 8 + GBK 解码 7，纯托管组，CI 每次跑）。
 
 ## 0. 先看这张表
 
 | # | 问题 | 影响 | 优先级 | 归属仓 | 卡在哪 |
 |---|---|---|---|---|---|
 | 1 | ~~本轮修复尚未部署到服务器~~ **已于 2026-10-30 09:47 部署**（见 §1） | — | 已完成 | 部署 | — |
-| 2 | 240 帧强制断连未挪安全点 | 断在报单突发中间（后果已被对账兜住） | P1 | front | 需要「出站队列空」的判据 |
-| 3 | `FrontConnected` 触发重连仍看 `_socketAlive` | 极端时序下重连不触发 ⇒ 静默丢单 | P1 | client | 缺客户端会话日志，改错方向就是重连风暴 |
-| 4 | bot 会话日志未恢复（stdout → NUL） | 一切客户端侧问题只能靠前置反推 | P1 | hosts | 需先定日志轮转与体积上限 |
+| 2 | ~~240 帧强制断连未挪安全点~~ **已修（2026-10-30）** | — | 已完成 | front | 软点 240 打标 + 出站排空才断 + 硬顶 251 立即断；`ChannelReader.Count` 在本运行时抛 `NotSupportedException`，改用自记账队列深度。见 `DESIGN.md` §3.11 |
+| 3 | ~~`FrontConnected` 触发重连仍看 `_socketAlive`~~ **已修（2026-10-30）** | — | 已完成 | client | 门控换成「本条 trader 实例是否登过」（`_traderLoggedIn`）；风暴由单飞锁兜住，另加状态漂移日志。见 `../../ctp-net-client/DESIGN.md` §10 |
+| 4 | bot 会话日志 —— **启动器已就绪（2026-10-30），待部署** | 现在仍靠前置反推（服务器上还是 `>NUL` 版） | P1 | hosts | 仓库已给出 `scripts/directbot-launcher.cmd` + 两个 `run-direct-*.cmd`（按天 + 64MB 上限，最多两代）；复制到 `C:\Aether\direct-bot\` 即生效，**下次重启 bot 时一并换掉** |
 | 5 | 持仓其余字段仍是抓包常量 | 昨仓/成本/保证金/盈亏显示假值 | P1 | front | 无真样本 / 编码未知 |
 | 6 | 持仓量 >255 被截到 255 | 大仓位（现场 11254）显示错 | P1 | front | 单字节槽，加宽会失步 |
 | 7 | 查合约空结果不派发 | 客户端 30s 超时 | P2 | front | 缺 op=01 真前置空结果配对帧 |
@@ -25,11 +25,11 @@
 | 10 | 行情退订 `UnSubscribeMarketData` 未实现 | 只能重连退订 | P2 | front | 无抓包 |
 | 11 | `RtnInstrumentStatus` 未实现 | 合约状态变更客户端收不到 | P3 | front | 无抓包 |
 | 12 | tick 无毫秒槽、开高低/昨结昨收缺失 | 高频对齐做不了 | P3 | front | 字段 tag 未逆向 |
-| 13 | `OrderRef` 仍取柜台 `MaxOrderRef` 初始化 | 跨重启/多会话的回卷风险 | P2 | client | 需要设计本地高水位 |
+| 13 | ~~`OrderRef` 仍取柜台 `MaxOrderRef` 初始化~~ **已修（2026-10-30）** | — | 已完成 | client | core `OrderRefFloor/HighWater` + client `IOrderRefHighWaterStore`（SQLite `ctp_order_ref`，只升不降），登录起点 = `max(柜台 MaxOrderRef, 本地高水位)`。见 `../../ctp-net-client/DESIGN.md` §10 |
 | 14 | 撤单仍按 `(账户, OrderRef)` 定位 | 交易所侧无 `OrderSysID` 语义 | P2 | front + exchange | 牵涉交易所账本 |
 | 15 | 错误码 >255 降级为 148 | 客户端丢精度 | P3 | front | 需抓包定槽 |
 | 16 | 模板文件仍含历史会话字节 | 不可复现、含旧凭据残留 | P2 | front | 重生成可能改帧宽 |
-| 17 | 分帧器/字段编解码器无独立单测 | 心跳跨段等边界无覆盖 | P2 | front | 成本低，一直没排期 |
+| 17 | ~~分帧器/字段编解码器无独立单测~~ **已修（2026-10-30）** | — | 已完成 | front | `FrameParserTests` 8 例 + `FieldCodecTests` 6 例 |
 | 18 | E2E 无法进 CI（缺 linux-x64 `.so`） | 回归只能本地跑 | P2 | core | 原生依赖打包问题 |
 | 19 | 直连旁路未退役 | 两套路径并存 | P3 | hosts | 依赖 #2/#3/#4 完成 |
 | 20 | **结算确认应答在 Windows 客户端下不被派发** | 客户端 `LoginAsync` 每次都等 15s 超时（不影响登录与后续查询） | P1 | front | **前置侧已排除**（跨公网 macOS 客户端连同一前置成功）；两平台同为官方 API **v6.7.2**（仅构建日期/胶水版本不同）⇒ **未定性**，只差「69B 是否到达 Windows 客户端」这一步 |
@@ -153,8 +153,13 @@
   要做映射表 + 结构化槽，得先抓包确认槽位。
 - **#16 模板文件仍含历史会话字节**：头注写着含 token/密文/账号，原抓包已清空。重生成可能改帧宽，
   多行/tick 未逆向前不要盲重生成。
-- **#17 分帧器/字段编解码器无独立单测**：`CtpFrameParser` / `CtpFieldCodec` 没有直接测试，心跳跨段未覆盖。
-  成本很低（纯内存用例），只是一直没排期。
+- ~~**#17 分帧器/字段编解码器无独立单测**~~ **已修（2026-10-30）**：新增
+  `tests/Ctp.Net.Front.Tests/FrameParserTests.cs`（8 例：单帧/多帧/半帧跨段/心跳夹在两帧之间/
+  **心跳跨 TCP 段**/握手帧/未知帧头逐字节跳过/超长垃圾兜底）与 `FieldCodecTests.cs`
+  （6 例：E7+FE 提取、索引与查找、`ExtractField` 的 minLen 防 op 签名误报、E6 密文 Base64、
+  编码族形态、**裸插标记字节切断字段**）。纯内存，87ms 跑完。
+  <br>顺带更正一条旧注释：`CtpFrameParser` 原写「心跳 6B 被 TCP 跨段分割（概率趋零，不覆盖）」，
+  实测**能认出**——剥离循环在解析循环开头每轮重跑，凑齐 6B 的那次 Feed 就命中，已有用例钉住。
 
 ### #20 结算确认应答在官方 Windows 客户端下不被派发（2026-10-30 部署后实测新发现）
 
