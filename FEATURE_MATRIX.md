@@ -4,7 +4,9 @@
 > 再对齐「本前置实现了哪些」「② 客户端导出面能发哪些」「真前置抓包实证过哪些」。
 > 数据来源：SDK 头文件枚举、`CtpFrontSession`/`CtpFrontMdSession` 的签名分支、`CtpTrader` 的公开方法、
 > `~/aether-bots/simnow/capture/`（真前置实抓，本地留存、永不入 git）。
-> 最后更新：2026-10-29（新增 §7 会话语义；请求面本次未变）。
+> 最后更新：2026-10-30（请求面未变；补一条外部客户端验证——桌面端跨公网连 17802 收 tick，
+> 见 `doc/open-issues.md` §1。注意服务器上的前置构建**早于**今天合入的 `240` 安全点回收修复，
+> 本文所有「已验证」结论都是在**旧构建**上得到的，新构建尚未跑真实负载）。
 
 ## 0. 总账
 
@@ -27,7 +29,7 @@
 | 2 | `ReqUserLogin` | `E101E23010` | ⑦登录 → ⑩主帧 + 伴随帧 | 解出 FrontID/SessionID/MaxOrderRef |
 | 3 | （SDK 自动）系统信息 | `E43024E501` / `E43027E501` | ⑨ 应答 | 真前置同款 |
 | 4 | （SDK 自动）终端信息采集 | `E430E60501` | 识别并**不应答**（与真前置一致） | 抓包实证 |
-| 5 | `ReqSettlementInfoConfirm` | `E101E24013` | ⑪⑬ → 65B payload | 真前置逐字节一致（golden 测试）+ 本地 E2E `ErrorID=0`；**服务器上官方 Windows dll 不派发该应答**（部署后实测，`open-issues.md` #20） |
+| 5 | `ReqSettlementInfoConfirm` | `E101E24013` | ⑪⑬ → 65B payload | 真前置逐字节一致（golden 测试）+ 本地 E2E `ErrorID=0`；~~服务器上官方 Windows dll 不派发该应答~~ **2026-10-30 11:55 复测已不复现**（新前置 + 新 console + 29 导出胶水，4 次登录全 `ErrorID=0`；根因待 A/B 定案，见 `open-issues.md` #20） |
 | 6 | `ReqQryTradingAccount` | `E104E28006` | ⑮ 资金 → 134B payload | golden 测试 + 实值 999927.69 |
 | 7 | `ReqQryInvestorPosition` | `E104E28004` | ⑰ 持仓 → 逐仓一帧（多行已验证）；**总仓/今仓已真实化**（2026-10-29 探针定位 payload@54 / @150，见 DESIGN §3.10） | 真前置两合约两仓 ⇒ 两行；E2E 5 手全字段对齐 + 300 手截 255 |
 | 8 | `ReqQryInstrument` | `E104E2802E` | 查合约 → 板子表（**名称槽未接线**：④ 品种表 2026-10-26 起带 `Name`（ax001=Aether币价期货）且 RPC/③ `CtpInstrument.Name` 已透传到本仓 mapper——wire 应答帧补 GBK 定宽名称槽属 follow-up，坑参照 P1#6d 查交易所：槽宽错整行被 SDK 静默丢弃） | 真前置 17335 行走二进制，客户端兼容 tag 逐行 |
