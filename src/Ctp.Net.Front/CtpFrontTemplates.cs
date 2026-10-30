@@ -161,6 +161,20 @@ internal static class CtpFrontTemplates
         return b[..n];
     }
 
+    /// <summary>可为零的 int 槽编码：**0 写成零字节**（不是 <c>0x00</c>）。
+    /// <para>
+    /// 2026-10-30 实测（probe1 真单）：查报单行帧的「剩余未成交量」@203 写 <c>0x00</c> 时，
+    /// SDK 仍派发该行但**整行字段全空**（<c>Instr=</c> 空、量为 0），客户端看到的就是一行空白委托；
+    /// 该槽非零时（未成交/部成交的活单）同一帧解得好。全账本对照：botmm 200 行里只有 11 行
+    /// 剩余量 &gt; 0 的行能解出合约号，其余 189 行（已撤/全成的历史单，剩余量都是 0）全空。
+    /// </para>
+    /// <para>
+    /// 「0 = 零字节」是这套去前导零编码的固有约定：<see cref="CtpOrderWireCodec.ParseMinimalInt"/>
+    /// 解空 span 就是 0（请求侧抓包的逆运算），故应答侧同样不能写一个实际为零的字节——
+    /// 写入的 <c>0x00</c> 会被当作「多出来的一个值字节」，此后整条记录错位、SDK 丢弃整行。
+    /// </para></summary>
+    internal static byte[] ZeroableInt(long v) => v == 0 ? [] : MinimalInt(v);
+
     /// <summary>大端 int 剥前导零（2 → 02、148 → 94、量 1 → 01——⑲/㉑ 实证；宽度随值）。</summary>
     internal static byte[] MinimalInt(long v)
     {
@@ -657,7 +671,7 @@ internal static class CtpFrontTemplates
             new Edit(200, 1, [(byte)orderStatus]),
             // 剩余未成交量（2026-10-24 整帧 patch-scan 定案：本槽 = payload @203，改它客户端 VolumeTotal 就跟着变）。
             // 同 @54 持仓量槽：1B 捕获宽，量 >127 时 MinimalInt 2B 撑宽（tag 终结的 int run 允许伸缩，未实测大值边界）。
-            new Edit(203, 1, MinimalInt(volumeTotal)),
+            new Edit(203, 1, ZeroableInt(volumeTotal)),
             new Edit(204, 8, F(tradingDay, 8)),
             new Edit(213, 8, F(insertTime, 8)),
             new Edit(232, 39, Cat(H("EB"), EscapedGbkFixed(statusMsg.Length == 0 ? " " : statusMsg, QryOrderMsgWidth)))
