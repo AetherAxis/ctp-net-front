@@ -274,8 +274,19 @@ internal sealed class CtpFrontSession : IDisposable
     /// </para>
     /// </summary>
     private int _rtnRecycleDue;   // 1 = 已过软点、待安全点回收；Interlocked 交换一次即消费
-    private const int RtnSoftLimit = 240;
-    private const int RtnHardLimit = 251;
+    /// <summary>软点/硬顶（可被环境变量下推——**仅排障用**）。</summary>
+    /// <remarks>
+    /// 存在理由：1-251 这个可接受域的全部证据来自 2026-10-19 的一次 E2E，方法细节没有留档，
+    /// 而它与三件事冲突——80 族同一个编码器 ≥256 走 E2 是**真前置 300 笔实抓**证实的；
+    /// 真前置抓包里的推送序号并不严格 +1（还出现过重复值）；真实柜台一个交易日的回报推送远不止 251 条。
+    /// 把两个阈值做成可下推的常量，是为了能用 <see cref="CtpFrontE2eF0SequenceTests"/> 那类实验
+    /// 直接问 SDK「252 到底收不收」，而不用改代码重编。默认值恒为 240/251，线上行为不变。
+    /// </remarks>
+    private static readonly int RtnSoftLimit = EnvInt("AETHER_CTP_F0_RECYCLE_SOFT", 240);
+    private static readonly int RtnHardLimit = EnvInt("AETHER_CTP_F0_RECYCLE_HARD", 251);
+
+    private static int EnvInt(string name, int fallback) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out var v) && v > 0 ? v : fallback;
 
     private int NextRtnInstance()
     {
@@ -897,10 +908,12 @@ internal sealed class CtpFrontSession : IDisposable
             return EnqueueRecords(frames, "查合约", qryId, firstSeq);
         }
 
-        // ⑲ 报单: E1 01 E2 40 E4 <计数器> —— 末字节随请求数递增（v2 抓包三单 = 05/06/07），匹配 5 字节前缀。
+        // ⑲ 报单: E1 01 E2 40 <op/实例字段> —— 该字段**随实例号变宽**（≤254 写 E4+1B，≥255 写 E3+2B），
+        // 钉死 5 字节签名会让会话第 ~127 单之后的报单全部掉进「未知业务帧」（2026-10-30 实测，
+        // 详见 CtpOrderWireCodec.IsOrderInsert 的注释）。判据改走 IsOrderInsert。
         // 成功 = 无应答帧（真 CTP 语义，2026-10-01 补抓包实证）——OnRtnOrder 推送经捕获缓冲随应答槽排空；
         // 风控拒单 = ⑳ 两子帧一次写（4001 + F003——F003 是 C# 层拒单唯一可见信号 → RspError）。
-        if (MatchesSignature(body, "E101E240E4"))
+        if (CtpOrderWireCodec.IsOrderInsert(body))
         {
             var o = CtpOrderWireCodec.ParseOrderInsert(body);
             if (o is null)
@@ -952,7 +965,7 @@ internal sealed class CtpFrontSession : IDisposable
 
         // ㉑ 撤单: E1 01 E2 40 06 —— core.CancelOrder（按 OrderRef 字符串匹配）。
         // 成功 = 4007 单帧（成功 RspInfo）+ OnRtnOrder('5') 推送；失败 = 4007+F004 两帧一次写。
-        if (MatchesSignature(body, "E101E240") && body.Length > 4 && body[4] == 0x06)
+        if (MatchesSignature(body, "E101E240") && body.Length > 4 && body[4] == CtpOrderWireCodec.OrderActionOp)
         {
             var a = CtpOrderWireCodec.ParseOrderAction(body);
             if (a is null)

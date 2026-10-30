@@ -24,9 +24,44 @@ internal static class CtpOrderWireCodec
     private static bool IsTag(byte b) => b is >= 0xE1 and <= 0xEF;
     private static bool IsDigit(byte b) => b is >= (byte)'0' and <= (byte)'9';
 
+    /// <summary>报单/撤单共用的路由头（<c>E1 01 E2 40</c>）。</summary>
+    private static ReadOnlySpan<byte> Route40 => [0xE1, 0x01, 0xE2, 0x40];
+
+    /// <summary>报单请求独有的 reqId 标记的**尾三字节** <c>01 01 7B</c>（撤单是 <c>01 01 3B</c>）。
+    /// <para>不用完整的 <c>E1 01 01 7B</c>：实例号是 0x0100 的整数倍时（256/512/768…，实测
+    /// <c>E3 01 E2</c>、<c>E3 02 E2</c>）SDK 会把这格前面的 <c>E1</c> 一并吃掉，帧变成
+    /// <c>E1 01 E2 40 E3 01 E2 01 01 7B …</c>——按 4 字节锚点会漏。</para></summary>
+    private static ReadOnlySpan<byte> InsertMarkerTail => [0x01, 0x01, 0x7B];
+
+    /// <summary>撤单请求的 op 字节：<c>E1 01 E2 40 <b>06</b> E3 &lt;实例号&gt;</c>。</summary>
+    internal const byte OrderActionOp = 0x06;
+
+    /// <summary>报单的 op 字节两副形态：单字节实例 <c>E4</c>、双字节实例 <c>E3</c>。</summary>
+    internal const byte OrderInsertOp1B = 0xE4;
+    internal const byte OrderInsertOp2B = 0xE3;
+
+    /// <summary>
+    /// 是不是一张<b>报单</b>请求帧——判据**不依赖 op 字段的字节宽度**。
+    /// <para>
+    /// 2026-10-30 实测（probe1 单会话连发 300 笔报单，逐帧对账前置日志与交易所库）：路由头
+    /// <c>E1 01 E2 40</c> 后面的 op/实例字段是<b>变宽</b>的。买/撤共用一条逐请求自增的计数器，
+    /// 买落偶数、撤落奇数；实例号 ≤254 时写成 <c>E4 &lt;1B&gt;</c>（抓包里 <c>E4 04/06/…/FE</c>），
+    /// 一旦 ≥255 改写成 <c>E3 &lt;2B&gt;</c>（实测 <c>E3 01 02</c> = 258、<c>E3 01 8E</c> = 398）。
+    /// 旧判据把签名钉成 5 字节 <c>E101E240E4</c>，越界之后每一张报单都掉进「未知业务帧」被静默丢弃：
+    /// 会话第 127 单起不再进交易所（两场实测分别停在 128/126 笔），随后该单的撤单回 90008
+    /// 「报单不存在」——客户端看到的就是「跑一阵就不干活了，重连又好了」。
+    /// </para>
+    /// </summary>
+    internal static bool IsOrderInsert(ReadOnlySpan<byte> body)
+        => body.Length > 8
+           && body[..4].SequenceEqual(Route40)
+           && body[4] is OrderInsertOp1B or OrderInsertOp2B   // 撤单/结算确认的 op 不在这一族
+           && body.IndexOf(InsertMarkerTail) >= 0;
+
     internal static ParsedOrderInsert? ParseOrderInsert(ReadOnlySpan<byte> body)
     {
-        var reqId = ByteAfter(body, "E101017BE3");
+        // 针尾取 3 字节：实例号是 0x0100 倍数时 SDK 会吃掉前面的 E1（见 InsertMarkerTail）
+        var reqId = ByteAfter(body, "01017BE3");
         // **全形状锚定**（2026-10-12 三轮探针定案）：SDK 的 tag 是动态值（实测随用户名长度/字段值宽联动漂移——
         // orderRef 的 tag = 0xEE−len(user)（6字符⇒E8、5⇒E9、3⇒EB）；枚举 tag = orderRef tag+2；量的 tag 实测
         // 出现 E3/E8/E9 三种；价格的 tag 实测恒 E4 但不保证）。按固定 tag 找字段天然脆弱——除 reqId 外全部
@@ -37,9 +72,19 @@ internal static class CtpOrderWireCodec
         var enums = RunLast(body, 0, r => r.Length == 3 && r.ToArray().All(b => b is >= (byte)'0' and <= (byte)'4'));
         // 量：VolShape（前缀含 <0x20 低字节 + 尾字节 TimeCondition '1'-'4'）——任意 tag（实测 E3/E8/E9
         // 均出现过；帧内无其它「低字节+尾 TimeCondition」形状的 run）。先定位它的 tag 索引——价格锚点用。
-        var volTagIdx = FindRunIndex(body, VolShape);
+        // **扫描起点必须越过请求头**（2026-10-30 probe1 实测）：头的 op/实例字段随实例号变宽，
+        // 一旦 ≥256 就写成 `E3 <hi> <lo>`，而 `hi=0x01` 是个 <0x20 的字节、`lo` 又可能正好落在
+        // ASCII '1'-'4'——`E3 01 32` / `E3 01 34` 于是整段满足 VolShape（"量 1 + TimeCondition '2'/'4'"），
+        // FindRunIndex 命中的是帧头而不是量，价格锚点随之前移 ⇒ ParseOrderInsert 返回 null ⇒ 该单静默丢弃。
+        // 实例号每笔 +2（买偶/撤奇），低字节命中 '2'/'4' 的恰好是 306/308/562/564 这几个值——
+        // 与实测丢单的 ref 406/407/534/535 一一对应。
+        var payloadStart = body.IndexOf(InsertMarkerTail);
+        if (payloadStart < 0) return null;
+        payloadStart += InsertMarkerTail.Length;
+        var payload = body[payloadStart..];
+        var volTagIdx = FindRunIndex(payload, VolShape);
         if (volTagIdx < 0) return null;
-        var volRun = ExtractRunAt(body, volTagIdx);
+        var volRun = ExtractRunAt(payload, volTagIdx);
         // 价格：尾剥零大端 double——解码后 2-8B、非纯 ASCII 数字（4049='@I' 之类）、解析值在 (0,1e9) 合理区间。
         // **位置锚定**：价格紧跟在量 run 之前（帧序：…枚举 → "1" → 价格 → 量 → …）——在量的前缀里取
         // 最后一个合格 run（防帧头 reqId 族 01017B / 量后 0131 等小字节垃圾 run 误中——形状谓词对
@@ -50,7 +95,7 @@ internal static class CtpOrderWireCodec
         // 的长度/值判形状（旧版按裸 run 判 ⇒ 9B 转义 run 被长度帽 ≤8 拒收 ⇒ 价格误锚到 broker 字段
         // 解出 1.35E-301 垃圾价入簿）。
         var price = volTagIdx > 0
-            ? RunLast(body[..volTagIdx], 0, r => UnescapeRun(r).Length is >= 2 and <= 8
+            ? RunLast(payload[..volTagIdx], 0, r => UnescapeRun(r).Length is >= 2 and <= 8
                 && !r.ToArray().All(b => b is >= (byte)'0' and <= (byte)'9')
                 && ParseTrimmedDouble(r) is > 0 and < 1e9)
             : null;
@@ -118,7 +163,7 @@ internal static class CtpOrderWireCodec
     internal static List<string> DebugFields(ReadOnlySpan<byte> body)
     {
         var lines = new List<string>();
-        var reqId = ByteAfter(body, "E101017BE3");
+        var reqId = ByteAfter(body, "01017BE3");
         lines.Add($"reqId={(reqId is { } r ? r.ToString() : "null")}");
         var orderRef = RunLast(body, 0, OrderRefShape);
         lines.Add($"orderRef={(orderRef is null ? "null" : Encoding.ASCII.GetString(orderRef))}");
