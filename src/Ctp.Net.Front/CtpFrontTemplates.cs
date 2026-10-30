@@ -39,6 +39,21 @@ internal static class CtpFrontTemplates
         return Encoding.ASCII.GetBytes(v);
     }
 
+    /// <summary>
+    /// 记录帧里主合约槽的宽度（⑯ 报单 / ⑱ 持仓 / ⑲ 成交 /  tick 全部按 5 字节捕获而定宽）。
+    /// 超宽会被 <see cref="F"/> **静默截断**（"rb2510" ⇒ "rb251"）——截断后的合约在客户端能匹配到
+    /// 另一个不存在的品种上，比报错危险得多（2026-10-29 盘点出的潜在缺陷 #7）。因此各应答/推送
+    /// 构造点用 <see cref="FitsInstrument"/> 先判宽，超宽即跳过该行并落日志（宁可少一行，不给错一行）。
+    /// </summary>
+    internal const int RecordInstrumentWidth = 5;
+
+    /// <summary>查合约应答记录帧的合约槽宽度（6 字节——真前置抓包 "sc2706" 定宽）。</summary>
+    internal const int InstrumentQueryWidth = 6;
+
+    /// <summary>合约号能否塞进指定宽度的槽而不被截断（<see cref="F"/> 会截断，不报错）。</summary>
+    internal static bool FitsInstrument(string? instrumentId, int width)
+        => !string.IsNullOrEmpty(instrumentId) && instrumentId.Length <= width;
+
     /// <summary>资金字段值：大端 double（8B）。</summary>
     internal static byte[] Money(double v)
     {
@@ -355,9 +370,17 @@ internal static class CtpFrontTemplates
     /// 券商 offset 决策不消费。多行收集在 wrapper 静默期收尾（2026-10-05——与查合约同路径：tag 帧恒
     /// isLast=true，多仓行全部到达 CtpTrader.OnQueryItem 静默窗）。
     /// </summary>
+    /// <summary>
+    /// 测试钩子（2026-10-29 槽位探针）：持仓记录帧写完后允许测试逐字节改写，用来定位「客户端真正读的是哪个槽」。
+    /// 生产恒为 null。<b>为什么需要它</b>：原「E7 槽 = 总仓」的结论只用过 1 手样本验证，而捕获模板本身
+    /// 就是 1 手 ⇒ 写入值与被覆盖的常量同值，假阳性无法区分；这次用 5 手暴露出来（客户端仍读到 1）。
+    /// </summary>
+    internal static Action<byte[]>? QryPositionRecordHook;
+
     internal static byte[] BuildQryPositionRsp(int instance, byte reqId, string brokerId, string investorId,
-        string instrumentId, string exchangeId, string tradingDay, char directionChar, char positionDateChar, int totalPosition) =>
-        Apply(QryPositionRspTemplate,
+        string instrumentId, string exchangeId, string tradingDay, char directionChar, char positionDateChar,
+        int totalPosition, int todayPosition, Action<string>? warn = null) =>
+        Hooked(Apply(QryPositionRspTemplate,
             new Edit(9, 2, InstanceField(instance)),
             new Edit(16, 1, EscapedValue(reqId)),
             new Edit(21, 5, F(instrumentId, 5)),
@@ -367,7 +390,11 @@ internal static class CtpFrontTemplates
             new Edit(50, 3, A($"{directionChar}{'1'}{positionDateChar}")),
             // 量槽捕获 1B（E7 tag + MinimalInt）——总仓 ≥256 时 MinimalInt 2B 撑宽（MM 仓限 ±200 达不到；
             // SDK 请求侧对大整数有 E7 切换惯例但本槽 tag 已是 E7，未实测边界——如实撑宽）。
-            new Edit(54, 1, MinimalInt(totalPosition)),
+            new Edit(54, 1, VolumeSlot(totalPosition, 54, "总仓", warn)),
+            // 今仓槽 = payload offset 150（2026-10-29 探针定位：该字节 1→7 时客户端 TodayPosition 恰好 1→7，
+            // 0/5/100/255 全部逐一验证；同批确认 54 = 总仓）。此前该槽一直是捕获常量 1 ⇒
+            // 客户端永远看到「今仓 1」，昨夜仓与今仓的拆分不可信。
+            new Edit(150, 1, VolumeSlot(todayPosition, 150, "今仓", warn)),
             new Edit(123, 8, A(tradingDay)),
             new Edit(163, 3, F(exchangeId, 3)),
             new Edit(167, 4, F(instrumentId, 4)),
@@ -375,7 +402,27 @@ internal static class CtpFrontTemplates
             new Edit(186, 3, F(exchangeId, 3)),
             new Edit(190, 5, F(instrumentId, 5)),
             new Edit(196, 5, F(instrumentId, 5))
-        );
+        ));
+
+    /// <summary>
+    /// 单字节量槽写入。槽宽 1B 是抓包实证（`E7 01` / `E1 01`），实测 0..255 逐值可用；
+    /// 超过 255 时**截到 255 并告警**——旧注释里「MinimalInt 2B 撑宽」是未验证的猜测，
+    /// 撑宽会整体后移后续字段（记录帧是定宽遍历的，2026-10-13 那类断连风暴的成因），
+    /// 所以这里选择「小而不崩 + 明确日志」，而不是拿帧宽去赌。
+    /// </summary>
+    private static byte[] VolumeSlot(int value, int offset, string what, Action<string>? warn)
+    {
+        var v = Math.Clamp(value, 0, 255);
+        if (v != value)
+            warn?.Invoke($"[CTP-Front] 持仓{what}={value} 超过单字节槽上限，按 255 上报（槽在 payload@{offset}，加宽会失步）");
+        return [(byte)v];
+    }
+
+    private static byte[] Hooked(byte[] record)
+    {
+        QryPositionRecordHook?.Invoke(record);
+        return record;
+    }
 
     /// <summary>
     /// 查报单空应答（13B payload / 17B 线上——2026-10-03 SimNow 实抓：过滤无匹配报单的合约时真前置回此 tag

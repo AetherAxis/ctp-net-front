@@ -47,6 +47,13 @@ internal sealed class CtpFrontSession : IDisposable
     private readonly TcpClient _client;
     private readonly SimRpcClient _rpc;
     private readonly Action<string> _log;
+
+    /// <summary>「状态不确定」动作账本（进程级，跨会话存活——见 <see cref="FrontPendingLedger"/>）。
+    /// 可空：单元测试/单会话用法不接账本时行为与旧版一致（不确定即失败，不记不补）。</summary>
+    private readonly FrontPendingLedger? _pending;
+
+    /// <summary>同账户活动会话登记（可空——单元测试/单会话用法不接）。</summary>
+    private readonly FrontSessionRegistry? _sessions;
     private State _state = State.WaitingHandshake;
     private readonly CtpFrameParser _parser = new();
 
@@ -71,11 +78,14 @@ internal sealed class CtpFrontSession : IDisposable
     private readonly List<byte[]> _captured = new();
     private volatile bool _dispatching;
 
-    public CtpFrontSession(TcpClient client, SimRpcClient rpc, Action<string> log)
+    public CtpFrontSession(TcpClient client, SimRpcClient rpc, Action<string> log,
+        FrontPendingLedger? pending = null, FrontSessionRegistry? sessions = null)
     {
         _client = client;
         _rpc = rpc;
         _log = log;
+        _pending = pending;
+        _sessions = sessions;
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -116,6 +126,7 @@ internal sealed class CtpFrontSession : IDisposable
         finally
         {
             _state = State.Closed;
+            _sessions?.Unregister(_userId, this);
             _rpc.OrderPushed -= OnRpcOrderPushed;
             _rpc.TradePushed -= OnRpcTradePushed;
             _rpc.ConnectionLost -= OnExchangeLost;
@@ -217,6 +228,99 @@ internal sealed class CtpFrontSession : IDisposable
     private static (int Id, string Msg) WireError(CtpBusinessException ex)
         => ex.ErrorId > byte.MaxValue ? (148, $"[{ex.ErrorId}] {ex.ErrorMsg}") : (ex.ErrorId, ex.ErrorMsg);
 
+    /// <summary>
+    /// 异常是否属于「<b>状态不确定</b>」——传输层失败（90012 未启动 / 90013 断连 / 90014 超时 / 90015 协议），
+    /// 交易所侧可能已经受理。与之相对，90001-90011 / 90016-90019 是**业务拒绝**：动作确定没发生，不必对账。
+    /// </summary>
+    private static bool IsUncertain(Exception ex)
+    {
+        var id = ex switch
+        {
+            Aether.Exchange.ExchangeBusinessException e => e.ErrorId,
+            CtpBusinessException c => c.ErrorId,
+            _ => 0,
+        };
+        return id is >= SimWireErrors.NotRunning and <= SimWireErrors.Protocol;
+    }
+
+    /// <summary>
+    /// 登录后的对账（2026-10-29）：把上一条会话留下的「状态不确定」动作补齐。
+    /// <list type="number">
+    /// <item><b>不确定的报单</b>：先查账本——交易所若有且仍活（'1' 部成 / '3' 在队），说明它其实落地了，
+    /// 而客户端当时收到的是失败、不会有人再管它 ⇒ 当作孤儿单撤掉；查不到或已终态 ⇒ 本来就没成，啥也不做。</item>
+    /// <item><b>丢失的撤单</b>：直接重放。撤单天然幂等——交易所回「单子不存在」或「不可撤」都说明目的已达成。</item>
+    /// </list>
+    /// 查询本身失败（交易所还没起来）⇒ 动作原样放回账本，等下一次登录。
+    /// </summary>
+    private async Task ReconcilePendingAsync(CancellationToken ct)
+    {
+        if (_pending is null || string.IsNullOrEmpty(_userId)) return;
+
+        var account = _userId;
+
+        var inserts = _pending.TakeInserts(account);
+        if (inserts.Count > 0)
+        {
+            IReadOnlyList<Aether.Exchange.Order> orders;
+            try
+            {
+                orders = await _rpc.QueryOrdersAsync(null, ct);
+            }
+            catch (Exception ex)
+            {
+                _log($"[CTP-Front] 对账：查报单失败（{AsCtpSafe(ex)}）——{inserts.Count} 条不确定报单放回账本，等下次登录");
+                foreach (var p in inserts) _pending.RecordInsert(account, p.OrderRef, p.InstrumentId);
+                return;   // 交易所都查不动，撤单重放也白搭
+            }
+
+            var live = orders.Where(o => (char)o.OrderStatusRaw is '1' or '3')
+                             .ToDictionary(o => o.OrderRef, StringComparer.Ordinal);
+            foreach (var p in inserts)
+            {
+                if (!live.TryGetValue(p.OrderRef, out var order))
+                {
+                    _log($"[CTP-Front] 对账：不确定报单 ref={p.OrderRef} 在交易所不存在或已终态——本来就没落地，无需处理");
+                    continue;
+                }
+                await ReplayCancelAsync(account, p.OrderRef, $"孤儿单（ref={p.OrderRef} {order.InstrumentId} {order.VolumeTotal}手 仍活着）", ct);
+            }
+        }
+
+        foreach (var p in _pending.TakeCancels(account))
+            await ReplayCancelAsync(account, p.OrderRef, $"断连期间丢失的撤单（ref={p.OrderRef}）", ct);
+    }
+
+    /// <summary>重放一次撤单；传输层再失败就放回账本（等下一次登录），业务拒绝视为「目的已达成」。</summary>
+    private async Task ReplayCancelAsync(string account, string orderRef, string why, CancellationToken ct)
+    {
+        try
+        {
+            await _rpc.CancelOrderAsync(CtpDomainMapper.ToDomainCancelKey(
+                new CtpOrderRef(_brokerId, account, 0, 0, orderRef, "")), ct);
+            _log($"[CTP-Front] 对账：已补撤 {why}");
+        }
+        catch (Exception ex) when (ex is CtpBusinessException or Aether.Exchange.ExchangeBusinessException)
+        {
+            if (IsUncertain(ex))
+            {
+                _log($"[CTP-Front] 对账：补撤 {why} 再次遇到传输失败（{AsCtpSafe(ex)}）——放回账本");
+                _pending?.RecordCancel(account, orderRef);
+                return;
+            }
+            // 90008 报单不存在 / 90009 不可撤：目的已达成（单子本来就不在或已终结）
+            _log($"[CTP-Front] 对账：补撤 {why} 被业务拒绝（{AsCtpSafe(ex)}）——按已完成处理");
+        }
+        catch (OperationCanceledException) { _pending?.RecordCancel(account, orderRef); throw; }
+    }
+
+    /// <summary>日志用：异常一句话（不动异常本身）。</summary>
+    private static string AsCtpSafe(Exception ex) => ex switch
+    {
+        Aether.Exchange.ExchangeBusinessException e => $"[{e.ErrorId}] {e.Message}",
+        CtpBusinessException c => $"[{c.ErrorId}] {c.ErrorMsg}",
+        _ => ex.Message,
+    };
+
     /// <summary>RPC 拒单异常归一：分仓后 SimRpcClient（Exchange.Rpc）抛 <c>ExchangeBusinessException</c>，
     /// 本类错误应答路径统一按 <c>CtpBusinessException</c> 消费（2026-10-23 测试迁移逮住的漏接：⑲/㉑ 只接
     /// CtpBusinessException ⇒ post-only 拒单异常逃逸打死会话泵，后续 op 全部超时）。</summary>
@@ -233,6 +337,11 @@ internal sealed class CtpFrontSession : IDisposable
     private void OnRpcOrderPushed(Aether.Exchange.Order order)
     {
         if (_state != State.Authenticated) return;
+        if (!CtpFrontTemplates.FitsInstrument(order.InstrumentId, CtpFrontTemplates.RecordInstrumentWidth))
+        {
+            _log($"[CTP-Front] → 推送丢弃: 合约号 '{order.InstrumentId}' 超过 {CtpFrontTemplates.RecordInstrumentWidth}B 槽宽（截断会变成别的品种）");
+            return;
+        }
         _log($"[CTP-Front] → 推送 OnRtnOrder: ref={order.OrderRef} status={(char)order.OrderStatusRaw}");
         RoutePush(BuildFrame((char)order.OrderStatusRaw switch
         {
@@ -280,17 +389,30 @@ internal sealed class CtpFrontSession : IDisposable
     private void OnRpcTradePushed(Aether.Exchange.Trade trade)
     {
         if (_state != State.Authenticated) return;
+        if (!CtpFrontTemplates.FitsInstrument(trade.InstrumentId, CtpFrontTemplates.RecordInstrumentWidth))
+        {
+            _log($"[CTP-Front] → 推送丢弃: 成交合约号 '{trade.InstrumentId}' 超过 {CtpFrontTemplates.RecordInstrumentWidth}B 槽宽");
+            return;
+        }
         _log($"[CTP-Front] → 推送 OnRtnTrade: ref={trade.OrderRef} {(char)trade.Direction}{(char)trade.OffsetFlag} {trade.Volume}@{trade.Price} id={trade.TradeId}");
         RoutePush(BuildFrame(CtpFrontTemplates.BuildRtnTrade(NextRtnInstance(), _userId, _brokerId, trade.InstrumentId, trade.OrderRef,
             trade.TradeId, (char)trade.Direction, (char)trade.OffsetFlag, trade.Price, trade.Volume, _login?.TradingDay ?? "")));
     }
 
     /// <summary>交易所侧连接死亡（host 挂/超时销毁）⇒ 关闭本 CTP 会话（客户端见断线——真实券商行为）。</summary>
-    private void OnExchangeLost()
+    private void OnExchangeLost() => Kick("交易所连接断开");
+
+    /// <summary>
+    /// 前置主动关闭本会话（交易所断链 / 同账户重复登录）。
+    /// 关闭后读循环退出 → finally 收尾（RPC 登出、出站排空、账户注销）。客户端看到的是断线，
+    /// SDK 会自动重连并（经 <c>CtpSessionService</c>）重新认证 + 登录。
+    /// </summary>
+    internal void Kick(string reason)
     {
-        _log("[CTP-Front] 与交易所的 RPC 连接断开——关闭会话");
+        if (_state == State.Closed) return;
         _state = State.Closed;
-        try { _client.Close(); } catch { }   // 读写循环随之退出
+        _log($"[CTP-Front] 会话关闭：{reason}");
+        try { _client.Close(); } catch { }
     }
 
     /// <summary>主动推送入站（core 事件 → wire 帧）。分发期间入捕获缓冲（应答先于推送），否则直写队列。</summary>
@@ -438,6 +560,24 @@ internal sealed class CtpFrontSession : IDisposable
             _state = State.Authenticated;
             _rpc.OrderPushed += OnRpcOrderPushed;       // M2：推送管道（按连接路由——只收本账户）
             _rpc.TradePushed += OnRpcTradePushed;
+
+            // 同账户重复登录 ⇒ 踢旧会话（2026-10-29，真柜台语义）：交易所的 SessionID 恒为 1、
+            // OrderRef 只在账户内唯一，两条会话并存会静默互相顶单/撤错单。见 FrontSessionRegistry。
+            if (_sessions is not null)
+            {
+                var previous = _sessions.Register(_userId, this);
+                if (previous is not null)
+                {
+                    _log($"[CTP-Front] 账户 {_userId} 重复登录——踢掉旧会话（防 SessionID/OrderRef 互踩）");
+                    previous.Kick("同账户新会话登录");
+                }
+            }
+
+            // 断连遗留动作对账（2026-10-29）：上一条同账户会话里「发出去但没拿到确定结果」的撤单/报单
+            // 在这里补做——登录是本账户唯一能拿到活 RPC 的时刻（见 FrontPendingLedger 注释）。
+            // 失败绝不影响登录本身：账本条目会在失败路径里放回，下次登录再来。
+            await ReconcilePendingAsync(ct);
+
             return BuildFrame(CtpFrontTemplates.BuildLoginRsp(_brokerId, _userId));
         }
         catch (CtpBusinessException ex)
@@ -508,11 +648,12 @@ internal sealed class CtpFrontSession : IDisposable
             var positions = await _rpc.QueryPositionsAsync(null, ct);   // 绑定账户全量
             _log($"[CTP-Front] 持仓查询 reqId={reqId} → {positions.Count} 条");
             if (reqId is not { } id) return null;
+            positions = SkipOverWide(positions, p => p.InstrumentId, "持仓");
             if (positions.Count == 0)
                 return BuildFrame(CtpFrontTemplates.BuildQryPositionEmptyRsp(NextQrySeq(), id));
             var frames = positions.Select(p => BuildFrame(CtpFrontTemplates.BuildQryPositionRsp(
                 NextQrySeq(), id, _brokerId, _userId, p.InstrumentId, p.ExchangeId, day,
-                (char)p.PosiDirection, (char)p.PositionDate, p.TotalPosition))).ToArray();
+                (char)p.PosiDirection, (char)p.PositionDate, p.TotalPosition, p.TodayPosition, _log))).ToArray();
             var total = frames.Sum(b => b.Length);
             var buf = new byte[total];
             var off = 0;
@@ -563,6 +704,7 @@ internal sealed class CtpFrontSession : IDisposable
         {
             var tradeReqId = ExtractReqIdAfter(body, "E101E1CDE3");
             var trades = await _rpc.QueryTradesAsync(null, ct);
+            trades = SkipOverWide(trades, t => t.InstrumentId, "查成交");
             if (tradeReqId is not { } tid) return null;
             if (trades.Count == 0)
             {
@@ -593,6 +735,7 @@ internal sealed class CtpFrontSession : IDisposable
             // 必须等于请求值，写前置自己的序列号会被 SDK 丢弃 ⇒ 查询 30s 超时）。
             var counter = body.Length > 5 ? body[5] : (byte)NextQrySeq();
             var orders = await _rpc.QueryOrdersAsync(null, ct);
+            orders = SkipOverWide(orders, o => o.InstrumentId, "查报单");
             if (reqId is not { } id) return null;
             if (orders.Count == 0)
             {
@@ -639,6 +782,8 @@ internal sealed class CtpFrontSession : IDisposable
             var listed = await _rpc.QueryInstrumentsAsync(ct);   // Domain CtpInstrument（板子只读 id/交易所）
             _log($"查合约 reqId={reqId} → 上市 {listed.Count} 个: {string.Join(",", listed.Select(i => i.InstrumentId))}");
             if (reqId is not { } qryId) return null;
+            listed = SkipOverWide(listed, i => i.InstrumentId, "查合约", CtpFrontTemplates.InstrumentQueryWidth);
+            // 空表仍不应答（真前置对「0 行」的回帧形状没有样本——见 DESIGN.md「6e 已知边界」）。
             if (listed.Count == 0) return null;
             var frames = listed.Select(i =>
                 BuildFrame(CtpFrontTemplates.BuildQryInstrumentRsp(NextQrySeq(), qryId, i.InstrumentId, i.ExchangeId))).ToArray();
@@ -680,6 +825,13 @@ internal sealed class CtpFrontSession : IDisposable
             }
             catch (Exception ex) when (ex is CtpBusinessException or Aether.Exchange.ExchangeBusinessException)
             {
+                // 传输层失败 ⇒ 交易所可能已经受理了这张单，而客户端拿到的是失败、不会再来管它。
+                // 记账（跨会话存活），下次登录由 ReconcilePendingAsync 查实并撤掉孤儿单。
+                if (IsUncertain(ex))
+                {
+                    _pending?.RecordInsert(_userId, o.OrderRef, o.InstrumentId);
+                    _log($"[CTP-Front] 报单结果不确定（{AsCtpSafe(ex)}）——ref={o.OrderRef} 已记账，等登录后对账");
+                }
                 var cex = AsCtp(ex);
                 _log($"[CTP-Front] 报单拒绝: [{cex.ErrorId}] {cex.ErrorMsg}");
                 var inst = NextCmdInstance();
@@ -714,6 +866,13 @@ internal sealed class CtpFrontSession : IDisposable
             }
             catch (Exception ex) when (ex is CtpBusinessException or Aether.Exchange.ExchangeBusinessException)
             {
+                // 撤单在途断连（54,738 张僵尸单的真根因）：客户端以为撤成功、交易所里单子还活着。
+                // 记账 + 下次登录重放（撤单幂等：不存在/已终态都算完成）。
+                if (IsUncertain(ex))
+                {
+                    _pending?.RecordCancel(_userId, a.OrderRef);
+                    _log($"[CTP-Front] 撤单结果不确定（{AsCtpSafe(ex)}）——ref={a.OrderRef} 已记账，等登录后重放");
+                }
                 var cex = AsCtp(ex);
                 _log($"[CTP-Front] 撤单拒绝: [{cex.ErrorId}] {cex.ErrorMsg}");
                 var rsp = BuildFrame(CtpFrontTemplates.BuildOrderActionRspErr(inst, a.ReqId, WireError(cex).Id, WireError(cex).Msg, _userId, _brokerId, a.OrderRef));
@@ -726,6 +885,29 @@ internal sealed class CtpFrontSession : IDisposable
 
         _log($"[CTP-Front] 未知业务帧: body前缀={HexPrefix(body)} len={body.Length}");
         return null;
+    }
+
+    /// <summary>
+    /// 丢掉合约号塞不进记录帧槽位的行（<see cref="CtpFrontTemplates.RecordInstrumentWidth"/>）——
+    /// <see cref="CtpFrontTemplates.F"/> 对超宽值是**静默截断**不报错（"rb2510" ⇒ "rb251"），
+    /// 截断后的合约会被客户端当真品种用：下单打错标的、持仓对不上号。宁可少回一行并留日志。
+    /// </summary>
+    private List<T> SkipOverWide<T>(IReadOnlyList<T> rows, Func<T, string> instrumentOf, string what,
+        int width = CtpFrontTemplates.RecordInstrumentWidth)
+    {
+        if (rows.All(r => CtpFrontTemplates.FitsInstrument(instrumentOf(r), width)))
+            return rows as List<T> ?? rows.ToList();
+
+        var kept = new List<T>(rows.Count);
+        foreach (var r in rows)
+        {
+            var inst = instrumentOf(r);
+            if (CtpFrontTemplates.FitsInstrument(inst, width))
+                kept.Add(r);
+            else
+                _log($"[CTP-Front] {what}：合约号 '{inst}' 超过记录帧槽宽 {width}B（会被截断成别的品种）——该行不回");
+        }
+        return kept;
     }
 
     // —— 提取工具 ——

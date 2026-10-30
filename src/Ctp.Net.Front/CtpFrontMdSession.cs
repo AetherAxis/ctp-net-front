@@ -29,11 +29,25 @@ internal sealed class CtpFrontMdSession : IDisposable
     private readonly Action<string> _log;
     private State _state = State.WaitingHandshake;
     private readonly CtpFrameParser _parser = new();
-    private readonly HashSet<string> _subscribed = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>每合约最后一帧推送（同值快照去重的比较基准）；<see cref="_suppressedTicks"/> 只用于日志，告诉运维「静默」是被去重还是真没数据。</summary>
+    /// <summary>本会话订阅集。<b>三线程访问</b>（读循环 Add / RPC 接收线程 Contains / 重建线程 ToList），
+    /// 全部经 <see cref="_subscribedGate"/>——旧版裸 <c>HashSet</c> 在高频订阅+重建下会抛
+    /// <c>InvalidOperationException</c> 或读到撕裂集合（2026-10-29 修）。</summary>
+    private readonly HashSet<string> _subscribed = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _subscribedGate = new();
+
+    /// <summary>每合约最后一帧推送——<b>逐字节</b>同值去重（2026-10-25 引入，2026-10-29 复核后保留）。
+    /// 整帧（含时间与全部量价字段）逐字节相同 ⇒ 对客户端零新信息，纯带宽/native 处理浪费；
+    /// 只要有一个字节不同就不吞。判据与「健康度」无关：`去重跳过 N` 衡量的是「簿变更 vs 上报字段变化」，
+    /// 不要拿它当行情活跃度指标（见 doc/md-tick-delivery.md §6）。锁保护：重建期间新旧 RPC 的
+    /// OnTick 可能短暂并发（旧连接在 SwapRpc 前已摘事件，但已在途的回调仍会跑完）。</summary>
     private readonly Dictionary<string, byte[]> _lastTickFrame = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _lastTickGate = new();
     private int _suppressedTicks;
+
+    /// <summary><see cref="_rpc"/> 的读写闸：重建线程会整条替换它，读循环/推送线程可能正拿着旧的
+    /// ——替换与使用都走这把锁，避免「重建中把新连接 Dispose 掉」（旧版 finally 直接 Dispose 字段）。</summary>
+    private readonly object _rpcGate = new();
 
     // 交易所时钟缓存（MD 登录时经 quotes op 取——tick 的 day/time 空值兜底，替代进程内直调核心时钟）
     private string _tradingDay = "";
@@ -91,12 +105,15 @@ internal sealed class CtpFrontMdSession : IDisposable
         finally
         {
             _state = State.Closed;
-            _rpc.TickPushed -= OnTick;
-            _rpc.Unsubscribe();     // 服务端清本连接订阅集（fire-and-forget）
-            _rpc.Dispose();
+            // 取当前 RPC 的快照再收尾：重建线程可能已经把 _rpc 换成新连接，直接对字段操作会
+            // 把别人的活连接 Dispose 掉（旧版竞态——留下的行情连接只挂在交易所侧，客户端不再收 tick）。
+            var rpc = SnapshotRpc();
+            try { rpc.TickPushed -= OnTick; } catch { }
+            try { rpc.Unsubscribe(); } catch { }     // 服务端清本连接订阅集（fire-and-forget）
+            try { rpc.Dispose(); } catch { }
             _out.Writer.TryComplete();
             try { await writer; } catch { }
-            _log($"MD 会话结束: {remote}（订阅 {string.Join(",", _subscribed)}）");
+            _log($"MD 会话结束: {remote}（订阅 {string.Join(",", SubscribedSnapshot())}）");
         }
     }
 
@@ -175,12 +192,44 @@ internal sealed class CtpFrontMdSession : IDisposable
     /// <summary>连接交易所 RPC + 取时钟 + 挂 tick/断连事件（登录与重建共用）。</summary>
     private async Task ConnectRpcAsync(CancellationToken ct)
     {
-        _rpc.ConnectionLost += OnRpcConnectionLost;
-        await _rpc.ConnectAsync(ct);
-        var clock = await _rpc.GetQuotesAsync(null, ct);
+        var rpc = SnapshotRpc();
+        rpc.ConnectionLost += OnRpcConnectionLost;
+        await rpc.ConnectAsync(ct);
+        var clock = await rpc.GetQuotesAsync(null, ct);
         _tradingDay = clock.TradingDay;
         _timeOfDay = clock.TimeOfDay;
-        _rpc.TickPushed += OnTick;   // tick 按本连接订阅集路由（服务端 MatchesAccount/SubscribedTo 路由）
+        rpc.TickPushed += OnTick;   // tick 按本连接订阅集路由（服务端 MatchesAccount/SubscribedTo 路由）
+    }
+
+    private SimRpcClient SnapshotRpc()
+    {
+        lock (_rpcGate) return _rpc;
+    }
+
+    /// <summary>替换 <see cref="_rpc"/> 并返回旧连接（调用方负责摘事件 + Dispose）。</summary>
+    private SimRpcClient SwapRpc(SimRpcClient next)
+    {
+        lock (_rpcGate)
+        {
+            var old = _rpc;
+            _rpc = next;
+            return old;
+        }
+    }
+
+    private bool AddSubscribed(string instrument)
+    {
+        lock (_subscribedGate) return _subscribed.Add(instrument);
+    }
+
+    private bool IsSubscribed(string instrument)
+    {
+        lock (_subscribedGate) return _subscribed.Contains(instrument);
+    }
+
+    private List<string> SubscribedSnapshot()
+    {
+        lock (_subscribedGate) return _subscribed.ToList();
     }
 
     /// <summary>交易所 RPC 死亡（host 重启/超时销毁）——不重建 ⇒ 本连接 tick 静默停、客户端无感知地看死行情
@@ -199,12 +248,14 @@ internal sealed class CtpFrontMdSession : IDisposable
                 try
                 {
                     _log($"MD RPC 断开——重建交易所连接（第 {attempt} 次）…");
-                    try { _rpc.TickPushed -= OnTick; _rpc.ConnectionLost -= OnRpcConnectionLost; _rpc.Dispose(); } catch { }
-                    _rpc = _rpcFactory();
+                    var old = SnapshotRpc();
+                    try { old.TickPushed -= OnTick; old.ConnectionLost -= OnRpcConnectionLost; old.Dispose(); } catch { }
+                    SwapRpc(_rpcFactory());
                     await ConnectRpcAsync(CancellationToken.None);
-                    if (_subscribed.Count > 0)
-                        await _rpc.SubscribeAsync(_subscribed.ToList(), CancellationToken.None);
-                    _log($"MD RPC 重建成功——重订阅 {string.Join(",", _subscribed)}");
+                    var symbols = SubscribedSnapshot();
+                    if (symbols.Count > 0)
+                        await SnapshotRpc().SubscribeAsync(symbols, CancellationToken.None);
+                    _log($"MD RPC 重建成功——重订阅 {string.Join(",", symbols)}");
                     return;
                 }
                 catch (Exception ex)
@@ -243,11 +294,11 @@ internal sealed class CtpFrontMdSession : IDisposable
             {
                 var inst = Encoding.ASCII.GetString(body[(i + 1)..j]);
                 if (!requested.Contains(inst)) requested.Add(inst);
-                if (_subscribed.Add(inst)) added.Add(inst);
+                if (AddSubscribed(inst)) added.Add(inst);
             }
             i = j - 1;
         }
-        _log($"订阅: 请求[{string.Join(",", requested)}] 新增[{string.Join(",", added)}] → 共 {_subscribed.Count} 个");
+        _log($"订阅: 请求[{string.Join(",", requested)}] 新增[{string.Join(",", added)}] → 共 {SubscribedSnapshot().Count} 个");
         if (requested.Count == 0)
         {
             _log("订阅帧里没有可识别合约——不回应答（旧版回抓包模板，等于凭空宣告 4 个别人的合约）");
@@ -259,8 +310,9 @@ internal sealed class CtpFrontMdSession : IDisposable
         // 快照经 `quotes` op 应答取（进程内版 = Market.GetQuote 直调）；订阅经 `subscribe` op（服务端
         // 激活行情——订阅即激活）。先取快照再订阅：快照走应答通道，与订阅 op 的激活快照推送（如有）不冲突
         // （本会话 tick 路由在订阅登记后生效——两个来源的 tick 都按订阅集过滤，幂等）。
-        var snap = await _rpc.GetQuotesAsync(added, ct);
-        await _rpc.SubscribeAsync(added, ct);
+        var rpc = SnapshotRpc();
+        var snap = await rpc.GetQuotesAsync(added, ct);
+        await rpc.SubscribeAsync(added, ct);
 
         // 订阅应答 + 当前快照 tick **同一次 TCP 写**（真实前置行为——v2 抓包 664B = 195B rsp + 461B tick
         // 拼一个写；M0 = rsp + 12B 迷你帧同写）。单独推送 E4F101 会触发 native 无限重投（E2E 7 种
@@ -282,7 +334,13 @@ internal sealed class CtpFrontMdSession : IDisposable
 
     private void OnTick(Aether.Exchange.Tick tick)
     {
-        if (_state != State.Ready || !_subscribed.Contains(tick.InstrumentId)) return;
+        if (_state != State.Ready || !IsSubscribed(tick.InstrumentId)) return;
+        if (!CtpFrontTemplates.FitsInstrument(tick.InstrumentId, CtpFrontTemplates.RecordInstrumentWidth))
+        {
+            // 超宽合约会被 BuildMdTick 的定宽槽静默截断成别的品种——丢帧并留痕，绝不发错标的的行情。
+            _log($"→ tick 丢弃: 合约号 '{tick.InstrumentId}' 超过 {CtpFrontTemplates.RecordInstrumentWidth}B 槽宽");
+            return;
+        }
         var day = string.IsNullOrEmpty(tick.TradingDay) ? _tradingDay : tick.TradingDay;
         // tick 推送（E4F103 流式 op——2026-10-02 长会话抓包定案：旧模板误用 E4F101 一次性快照 op，
         // 重复推送快照帧触发 native 无限重投；E4F103 是真实 tick 流 op，481 帧/次会话 SDK 零洪水）
@@ -290,19 +348,22 @@ internal sealed class CtpFrontMdSession : IDisposable
             string.IsNullOrEmpty(tick.UpdateTime) ? _timeOfDay : tick.UpdateTime,
             tick.LastPrice, tick.BidPrice, tick.AskPrice, tick.Volume, tick.BidVolume, tick.AskVolume, tick.OpenInterest));
 
-        // 同值快照去重（2026-10-25）：交易所对每次簿变更都发 tick，做市商阶梯撤改会把同一快照连发多次
-        // （客户端日志实测同一 tick 连出 4 次；极端情况下一笔不变快照被刷到几百次/秒）。逐字节相同的帧
-        // 对客户端没有任何新信息，只会放大带宽与 native 侧的重复处理。去重后「每秒推送数」才有意义。
-        if (_lastTickFrame.TryGetValue(tick.InstrumentId, out var previous) && previous.AsSpan().SequenceEqual(frame))
+        // 逐字节同值去重（保留——见字段注释与 doc/md-tick-delivery.md）：整帧完全相同才吞。
+        int suppressed;
+        lock (_lastTickGate)
         {
-            _suppressedTicks++;
-            return;
+            if (_lastTickFrame.TryGetValue(tick.InstrumentId, out var previous) && previous.AsSpan().SequenceEqual(frame))
+            {
+                _suppressedTicks++;
+                return;
+            }
+            _lastTickFrame[tick.InstrumentId] = frame;
+            suppressed = _suppressedTicks;
+            _suppressedTicks = 0;
         }
-        _lastTickFrame[tick.InstrumentId] = frame;
 
         _log($"→ 推送 tick: {tick.InstrumentId} last={tick.LastPrice} bid={tick.BidPrice} ask={tick.AskPrice}" +
-             (_suppressedTicks > 0 ? $"（去重跳过 {_suppressedTicks}）" : ""));
-        _suppressedTicks = 0;
+             (suppressed > 0 ? $"（去重跳过 {suppressed}）" : ""));
         RoutePush(frame);
     }
 

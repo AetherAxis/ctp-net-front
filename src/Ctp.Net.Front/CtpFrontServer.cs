@@ -23,6 +23,15 @@ public sealed class CtpFrontServer : IDisposable
     private Task? _acceptLoop;
     private readonly CancellationTokenSource _cts = new();
 
+    /// <summary>
+    /// 「状态不确定」动作账本（2026-10-29）——<b>进程级单例</b>：一条 CTP 会话死掉时它记录的动作要能
+    /// 交给下一条同账户会话去对账，所以不能挂在会话上（会话对象随断连一起没了）。
+    /// </summary>
+    private readonly FrontPendingLedger _pending;
+
+    /// <summary>同账户活动会话登记（同账户重复登录踢旧会话——见 <see cref="FrontSessionRegistry"/>）。</summary>
+    private readonly FrontSessionRegistry _sessions = new();
+
     public CtpFrontServer(string exchangeHost, int exchangePort, string host, int port, Action<string>? log = null)
     {
         _exchangeHost = exchangeHost;
@@ -30,9 +39,16 @@ public sealed class CtpFrontServer : IDisposable
         _host = host;
         _port = port;
         _log = log ?? (msg => Console.WriteLine($"[CTP-Front] {msg}"));
+        _pending = new FrontPendingLedger(log: _log);   // 账本自己的告警（满/过期丢弃）走同一条日志
     }
 
     public IPEndPoint? LocalEndpoint => _listener?.LocalEndpoint as IPEndPoint;
+
+    /// <summary>测试/诊断钩子：进程级「状态不确定」动作账本（见 <see cref="FrontPendingLedger"/>）。</summary>
+    internal FrontPendingLedger PendingLedger => _pending;
+
+    /// <summary>测试/诊断钩子：同账户活动会话登记（见 <see cref="FrontSessionRegistry"/>）。</summary>
+    internal FrontSessionRegistry SessionRegistry => _sessions;
 
     public void Start()
     {
@@ -63,7 +79,7 @@ public sealed class CtpFrontServer : IDisposable
             catch { break; }
 
             // 每客户端会话一条交易所 RPC 连接（未连接——会话在登录/MD 登录时自行连接）
-            var session = new CtpFrontSession(client, new SimRpcClient(_exchangeHost, _exchangePort), _log);
+            var session = new CtpFrontSession(client, new SimRpcClient(_exchangeHost, _exchangePort), _log, _pending, _sessions);
             _ = Task.Run(() => session.RunAsync(ct), ct);
         }
     }
