@@ -4,7 +4,7 @@
 > 再对齐「本前置实现了哪些」「② 客户端导出面能发哪些」「真前置抓包实证过哪些」。
 > 数据来源：SDK 头文件枚举、`CtpFrontSession`/`CtpFrontMdSession` 的签名分支、`CtpTrader` 的公开方法、
 > `~/aether-bots/simnow/capture/`（真前置实抓，本地留存、永不入 git）。
-> 最后更新：2026-10-24。
+> 最后更新：2026-10-29（新增 §7 会话语义；请求面本次未变）。
 
 ## 0. 总账
 
@@ -29,7 +29,7 @@
 | 4 | （SDK 自动）终端信息采集 | `E430E60501` | 识别并**不应答**（与真前置一致） | 抓包实证 |
 | 5 | `ReqSettlementInfoConfirm` | `E101E24013` | ⑪⑬ → 65B payload | 真前置逐字节一致（golden 测试） |
 | 6 | `ReqQryTradingAccount` | `E104E28006` | ⑮ 资金 → 134B payload | golden 测试 + 实值 999927.69 |
-| 7 | `ReqQryInvestorPosition` | `E104E28004` | ⑰ 持仓 → 逐仓一帧（多行已验证） | 真前置两合约两仓 ⇒ 两行 |
+| 7 | `ReqQryInvestorPosition` | `E104E28004` | ⑰ 持仓 → 逐仓一帧（多行已验证）；**总仓/今仓已真实化**（2026-10-29 探针定位 payload@54 / @150，见 DESIGN §3.10） | 真前置两合约两仓 ⇒ 两行；E2E 5 手全字段对齐 + 300 手截 255 |
 | 8 | `ReqQryInstrument` | `E104E2802E` | 查合约 → 板子表（**名称槽未接线**：④ 品种表 2026-10-26 起带 `Name`（ax001=Aether币价期货）且 RPC/③ `CtpInstrument.Name` 已透传到本仓 mapper——wire 应答帧补 GBK 定宽名称槽属 follow-up，坑参照 P1#6d 查交易所：槽宽错整行被 SDK 静默丢弃） | 真前置 17335 行走二进制，客户端兼容 tag 逐行 |
 | 9 | `ReqOrderInsert` | `E101E240E4` | ⑲ 报单（成功无应答 + RtnOrder 推送；风控拒单 ⑳ 两帧） | 真前置实下单 |
 | 10 | `ReqOrderAction` | `E101E24006` | ㉑ 撤单（**必须带 InstrumentID**，见 core DESIGN §5.1） | 真前置实撤成功 |
@@ -52,6 +52,7 @@
 | `ReqQryExchange` 记录格式 | 已实现（2026-10-24）；边界见下 | ① `ExchangeID + 简称槽 = 7 字节`（真帧 6 家无一例外；简称槽被 SDK 丢弃，只负责把名称顶到固定偏移 13）② 记录总长必须 **39 或 41 字节**（名称过短 ⇒ 31~37，SDK 丢该条并连带丢后续）③ 尾部形态与名称长度配套（≤16B 用 12B 短尾、>16B 用 8B 长名尾；多塞 `E2/E3` 字段组会把 Property 读成 0）。⇒ 本前置 ExchangeID ≤ 6 字符、名称 7~10 汉字；更长的组合未在真前置验证 |
 | `ReqQryInstrument` 空结果 | 过滤到不存在的合约 ⇒ 客户端 30s 超时 | 真前置其实会派发「空记录 + isLast」，但**本前置这条路不敢转发**（见 §4 的崩溃证据） |
 | 行情退订 `UnSubscribeMarketData` | 未实现 | 客户端与前置都没有 |
+| 持仓字段 | `YdPosition`/`PositionCost`/`UseMargin`/`PositionProfit`/`CloseProfit` 仍是抓包常量；量槽 >255 截到 255 | 总仓/今仓 2026-10-29 已真实化（DESIGN §3.10）；其余字段全量单字节扫描无任何字节能影响，需真样本 |
 | tick 字段 | 开高低/昨结昨收缺 | 成交量/档量/持仓量已真实化 |
 | tick 重复下发 / 量槽错位 | 同值快照照发（4 连发、风暴时几百帧/秒）；**更狠的是量槽裸插标记字节**（成交 11749=`00 2D E5`）→ 客户端按标记切字段错位 → native 无限重投同一笔 tick | 2026-10-25：① 按合约逐字节去重（日志标「去重跳过 N」）；② `FixedInt2/3` 过 `EscapedRaw`（E0 转义，同文本/金额槽）；③ ⑧ 配套 300ms 报价节流 |
 
@@ -112,3 +113,16 @@
 | 已实现 | 未实现 |
 |---|---|
 | `RtnOrder`、`RtnTrade`、`RtnDepthMarketData`、`ErrRtnOrderInsert`（风控拒单）、`ErrRtnOrderAction`（撤单失败）、`RspError` | `RtnInstrumentStatus`（合约状态变更——建议补）、`RtnTradingNotice`、`RtnPrivateSeqNo`、询价/报价/执行单/组合腿回报 |
+
+## 7. 会话语义（不属于请求面，但客户端会感知）
+
+上表按「请求/应答」列；下面这层是**连接行为**，2026-10-29 补齐（设计见 `DESIGN.md` §3.8、§3.9）：
+
+| 语义 | 真 CTP | 本前置（2026-10-29 前） | 本前置（现在） |
+|---|---|---|---|
+| 同账户重复登录 | 后登录踢前一条 | 允许并行（两条会话的回报按 `orderRef` 互踩） | **踢旧会话**（`FrontSessionRegistry`），与真柜台一致 |
+| 撤单在途断连 | 柜台侧动作仍会执行，客户端重连后从委托查询收敛 | 异常抛回客户端，交易所侧可能已执行也可能没执行，**没人管** | 传输不确定的撤单进 `FrontPendingLedger`，该账户下次登录时**幂等重放** |
+| 报单在途断连 | 同上 | 同上，且交易所侧可能留下孤儿活单 | 下次登录查一次委托，仍活着的当**孤儿单撤掉** |
+| 合约号超出槽宽 | 真前置自己也截（`E1` 槽） | 静默截断 ⇒ 变成另一个合约 | **丢该行 + 日志**（`FitsInstrument`，§3.9） |
+| 会话未认证/未登录就发单 | 柜台直接丢弃 | 前置按「非预期帧（等认证）」丢弃，客户端零感知（2026-10-29 事故） | 客户端 `CtpSessionService` 侧就抛 `CtpSessionNotReadyException`（见 `../../ctp-net-client/doc/session-reauth-after-reconnect.md` §7） |
+| 240 条推送后主动断连 | — | 攒满即断（与报单突发撞车） | **未改**（安全点化仍在 `DESIGN.md` §6 与 front `session-lifecycle.md` 待办里） |

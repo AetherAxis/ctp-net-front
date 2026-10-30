@@ -12,6 +12,8 @@ CTP 线协议前置服务器（券商侧接入层）——官方 CTP SDK 会话�
 | `CtpDomainMapper.cs` | SDK 类型 ↔ 契约 DTO 的转换入口 |
 | `CtpFrontTemplates.cs` | SDK 模板结构（由 ProtoCapture 生成器从 CTP 头文件生成） |
 | `RemoteCtpSession.cs` | 交易所侧会话端口适配（实现 Ctp.Net.ICtpSession 的远端半边） |
+| `FrontPendingLedger.cs` | 进程级「状态不确定」动作账本：断连遗留的撤单/报单留给下一条同账户会话对账 |
+| `FrontSessionRegistry.cs` | 同账户活动会话登记：重复登录踢掉旧会话（真柜台语义） |
 
 ## 构建与测试
 
