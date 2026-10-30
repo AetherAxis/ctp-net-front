@@ -110,26 +110,28 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
     }
 
     [Fact]
-    public async Task F0族推送序号达240_前置主动断开_新会话恢复()
+    public async Task F0族推送序号越过240_不回收_同一会话继续推送()
     {
-        // 2026-10-19 服务器长跑定案 + E2E 逐形态实证：F0 族推送 instance 的 SDK 可接受域为 1-251
-        // （224-239 转义对/240-251 裸值可过；E3 FC 起、E2 双字节区、回卷形态均被拒收——SDK 侧底层
-        // 限制，服务器无法扩域。此前双 bot「活跃 2-5 分钟假死」= 序号破界后推送全静默）。
-        // 前置策略：序号达 240 主动断开客户端（SDK 自动重连、新会话序号归零，客户端零改动——
-        // 生产链路 CtpSessionService 的 sim 前 24h 重连兜底接住）。本钉验证：
-        // ① 240 帧前推送正常；② 断开确实发生；③ 新会话（重登）推送恢复。
+        // 2026-10-30 probe1 单会话实测推翻了「SDK 只认 1-251」这个前提：一次会话连推 900 帧
+        // （instance 一路涨到 E2 双字节区），**零丢失、零断开**——客户端从未拒收。
+        // 旧策略「序号达 240 前置主动 Close」因此是自伤：它把一条健康会话砍成两半，
+        // 每次断开都会吃掉在途的推送（实测丢 4 笔报单回报 + 27 笔撤单回报）。
+        // 现策略：不回收，只在 65000（编码 2 字节的硬上限）前主动断开。
+        // 本钉验证：① 越过 240 之后推送照常；② 全程没有断开；③ 同一会话里成交闭环仍然完整。
         var dir = NewFlowDir();
         Directory.CreateDirectory(dir);
-        var trader = Login(dir);
+        using var trader = Login(dir);
         _sim.SeedMaker();
 
         var orders = new ConcurrentBag<Order>();
+        var trades = new ConcurrentBag<Trade>();
         var disconnected = new TaskCompletionSource();
         trader.OrderReceived += (_, o) => orders.Add(o);
+        trader.TradeReceived += (_, t) => trades.Add(t);
         trader.FrontDisconnected += (_, _) => disconnected.TrySetResult();
 
-        // ① 安全区内（<240 帧）：每张静默单 1 帧 F001，全部到达
-        for (var i = 0; i < 235; i++)
+        // ① 一路发到 260 帧，每张静默单 1 帧 F001——含跨过 240 之后的 20 张
+        for (var i = 0; i < 260; i++)
         {
             var r = await trader.OrderInsertAsync(new OrderRequest
             {
@@ -139,42 +141,25 @@ public sealed class CtpFrontE2eM2Tests : IDisposable
                 Volume = 1, ExchangeId = "DCE",
             });
             Assert.True(await UntilAsync(() => orders.Any(o => o.OrderRef == r.OrderRef)),
-                $"第 {i} 张静默单的受理推送未到达（安全区内，若失败与本钉无关）");
+                $"第 {i} 张静默单的受理推送未到达（序号={i + 1}）");
         }
 
-        // ② 继续发单越过 240 阈值：前置主动断开（4097）——15s 未断即超时失败
-        for (var i = 235; i < 250 && !disconnected.Task.IsCompleted; i++)
-        {
-            await trader.OrderInsertAsync(new OrderRequest
-            {
-                InvestorId = User, BrokerId = FrontLoopback.Broker, InstrumentId = Instrument,
-                Direction = Direction.Buy, OffsetFlag = OffsetFlag.Open,
-                PriceType = OrderPriceType.Limit, LimitPrice = 2700 + (i % 50),
-                Volume = 1, ExchangeId = "DCE",
-            });
-            await Task.Delay(100);
-        }
-        await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        // ② 越过 240 之后绝不能再发生断开（旧策略在这里 Close，SDK 表现为 4097）
+        Assert.False(disconnected.Task.IsCompleted, "序号越过 240 后前置不应主动断开");
+        await Task.Delay(1000);
+        Assert.False(disconnected.Task.IsCompleted, "序号越过 240 后前置不应主动断开");
 
-        // ③ 新会话（镜像生产重连重登）：推送恢复 + 成交闭环
-        trader.Dispose();
-        var dir2 = NewFlowDir();
-        Directory.CreateDirectory(dir2);
-        using var trader2 = Login(dir2);
-        var trades = new ConcurrentBag<Trade>();
-        var orders2 = new ConcurrentBag<Order>();
-        trader2.OrderReceived += (_, o) => orders2.Add(o);
-        trader2.TradeReceived += (_, t) => trades.Add(t);
-        var fill = await trader2.OrderInsertAsync(new OrderRequest
+        // ③ 同一会话继续用：成交 + 终态推送都要到（证明推送通道没被序号拖坏）
+        var fill = await trader.OrderInsertAsync(new OrderRequest
         {
             InvestorId = User, BrokerId = FrontLoopback.Broker, InstrumentId = Instrument,
             Direction = Direction.Buy, OffsetFlag = OffsetFlag.Open,
             PriceType = OrderPriceType.Limit, LimitPrice = 3100, Volume = 1, ExchangeId = "DCE",
         });
         Assert.True(await UntilAsync(() => trades.Any(t => t.OrderRef == fill.OrderRef), 15000),
-            "新会话（重登后）OnRtnTrade 未恢复——序号归零未生效");
-        Assert.True(await UntilAsync(() => orders2.Any(o => o.OrderRef == fill.OrderRef && (char)o.OrderStatusRaw == '0')),
-            "新会话成交终态推送未到达");
+            "序号越过 240 后 OnRtnTrade 未到达");
+        Assert.True(await UntilAsync(() => orders.Any(o => o.OrderRef == fill.OrderRef && (char)o.OrderStatusRaw == '0')),
+            "序号越过 240 后成交终态推送未到达");
     }
 
     [Fact]

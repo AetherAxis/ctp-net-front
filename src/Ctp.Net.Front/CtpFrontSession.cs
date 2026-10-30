@@ -203,8 +203,6 @@ internal sealed class CtpFrontSession : IDisposable
                 _log($"[CTP-Front] → [{frame.Length}B] {Convert.ToHexString(frame)}");
                 await stream.WriteAsync(frame, ct);
                 Interlocked.Decrement(ref _outPending);
-                // 这一帧真的出去了：若已过序号软点且队列已空，这里就是安全点（open-issues #2）
-                TryRecycleAtSafePoint();
             }
         }
         catch (OperationCanceledException) { }
@@ -254,36 +252,31 @@ internal sealed class CtpFrontSession : IDisposable
     /// 跳变，客户端推送序列校验拒收 ⇒ 其后整流停摆（混合流 225 轮实测）。E0..EF 值由 builder 的
     /// EscapedValue 编码为转义对（镜像 SDK 请求侧同款）；FE/FF 裸值是数据（254 轮定案）。</summary>
     private int _rtnInstanceInt;
-    /// <summary>F0 族推送序号计数：到 240 标记回收（SDK 可接受域实测 1-251——E3 FC 起、E2 双字节区、
-    /// 回卷形态均被拒收（2026-10-19 F0 族 E2E 实证；224-239 转义对/240-251 裸值可过）。序号是 SDK 侧
-    /// 底层限制，服务器端无法扩域——临界限即主动断开客户端连接（SDK 自动重连、新会话序号归零，
-    /// 客户端零改动）。240 = 251 减余量。相关：被 5c6f9ff 退役的客户端 220 规避重连实质是在兜同一
-    /// 限制（应答族 int 化只救了 80 族，救不了 F0 推送族）。
+
+    /// <summary>序号越过 <see cref="RtnWarnLimit"/> 时只提示一次（**不回收**）。</summary>
+    private int _rtnWarned;
+
+    /// <summary>
+    /// <b>2026-10-30：240/251 回收整体下掉。</b>
     /// <para>
-    /// <b>2026-10-30：断开挪到「安全点」（open-issues #2）</b>。旧版在入队那一刻立刻 <c>Close</c>——
-    /// 断口正好落在报单/成交推送的突发中间：客户端已经发出去的报单可能刚被受理，回报却断在链条上
-    /// （后果靠登录对账兜住，但每次 240 都要对一遍账）。现在拆成：
-    /// <list type="number">
-    /// <item><b>软点 240</b>：只打标（<see cref="_rtnRecycleDue"/>），不立刻断。</item>
-    /// <item><b>安全点</b>：出站队列排空 + 没有正在分发的应答（<c>_dispatching</c>/<c>_captured</c> 皆空）
-    /// 时才 <c>Close</c>——保证已生成的每一帧都已写出。</item>
-    /// <item><b>硬顶 251</b>：SDK 可接受上界。到这一步不再等安全点，立刻断，且该帧<b>不入队</b>
-    /// （>251 的序号会让客户端拒收整条流，写出去比丢掉更糟）。</item>
-    /// </list>
-    /// 软点与硬顶之间留 11 个号的余量，就是给「等队列排空」用的。
+    /// 旧实现认为「SDK 只接受 1~251 的推送序号」，到 240 打标、到 251 直接断，客户端重连后序号归零。
+    /// 这个前提<b>站不住</b>：今天在 probe1 上关掉回收跑单会话，连续推送 <b>900 条</b>，客户端一条不落地
+    /// 全部派发（最后一条是 ref 1154 的撤单回报），序号早已越过 251；把回收开回去，前置自己在 16:50:18
+    /// 打出「达安全点——主动断开客户端」，客户端 <c>reason=4097</c> 重连，当场丢 4 笔单 + 27 次撤单失败。
+    /// 也就是说这条「断连」是前置自己制造的，而它要防的边界并不存在。
+    /// </para>
+    /// <para>
+    /// 真正会卡死会话的是<b>请求侧</b>的收帧签名（见 open-issues #23，已修），与本计数器无关。
+    /// 现在序号只做观测：越过 <see cref="RtnWarnLimit"/> 打一行日志，然后继续推。
+    /// </para>
+    /// <para>
+    /// 唯一保留的断开点是 <see cref="RtnOverflowGuard"/>：编码只有 2 字节（≤65535），越过就是静默错帧，
+    /// 在那个位置主动重连一次严格优于把帧写坏。按实测强度（一次风暴 900 条）要七十多场才会碰到。
     /// </para>
     /// </summary>
-    private int _rtnRecycleDue;   // 1 = 已过软点、待安全点回收；Interlocked 交换一次即消费
-    /// <summary>软点/硬顶（可被环境变量下推——**仅排障用**）。</summary>
-    /// <remarks>
-    /// 存在理由：1-251 这个可接受域的全部证据来自 2026-10-19 的一次 E2E，方法细节没有留档，
-    /// 而它与三件事冲突——80 族同一个编码器 ≥256 走 E2 是**真前置 300 笔实抓**证实的；
-    /// 真前置抓包里的推送序号并不严格 +1（还出现过重复值）；真实柜台一个交易日的回报推送远不止 251 条。
-    /// 把两个阈值做成可下推的常量，是为了能用 <see cref="CtpFrontE2eF0SequenceTests"/> 那类实验
-    /// 直接问 SDK「252 到底收不收」，而不用改代码重编。默认值恒为 240/251，线上行为不变。
-    /// </remarks>
-    private static readonly int RtnSoftLimit = EnvInt("AETHER_CTP_F0_RECYCLE_SOFT", 240);
-    private static readonly int RtnHardLimit = EnvInt("AETHER_CTP_F0_RECYCLE_HARD", 251);
+    private static readonly int RtnWarnLimit = EnvInt("AETHER_CTP_F0_WARN", 240);
+
+    private const int RtnOverflowGuard = 65000;
 
     private static int EnvInt(string name, int fallback) =>
         int.TryParse(Environment.GetEnvironmentVariable(name), out var v) && v > 0 ? v : fallback;
@@ -291,7 +284,13 @@ internal sealed class CtpFrontSession : IDisposable
     private int NextRtnInstance()
     {
         var n = ++_rtnInstanceInt;
-        if (n >= RtnSoftLimit) Interlocked.Exchange(ref _rtnRecycleDue, 1);
+        if (n >= RtnWarnLimit && Interlocked.Exchange(ref _rtnWarned, 1) == 0)
+            _log($"[CTP-Front] F0 推送序号越过 {RtnWarnLimit}——**不回收**，继续按 E2 双字节编码推送");
+        if (n >= RtnOverflowGuard)
+        {
+            _log($"[CTP-Front] F0 推送序号 {n} 逼近 16 位上限 65535——主动断开（编码只有 2 字节，再推就是静默错帧）");
+            Kick("推送序号将溢出 16 位");
+        }
         return n;
     }
 
@@ -503,14 +502,6 @@ internal sealed class CtpFrontSession : IDisposable
     /// <summary>主动推送入站（core 事件 → wire 帧）。分发期间入捕获缓冲（应答先于推送），否则直写队列。</summary>
     private void RoutePush(byte[] frame)
     {
-        // 硬顶：序号已越过 SDK 可接受上界，这一帧**不入队**（写出去会让客户端拒收整条流），直接断。
-        if (Volatile.Read(ref _rtnInstanceInt) > RtnHardLimit && TryBeginRecycle())
-        {
-            _log($"[CTP-Front] F0 推送序号越过硬顶 {RtnHardLimit}——立即断开（该帧丢弃，客户端重连后重查自愈）");
-            try { _client.Close(); } catch { }
-            return;
-        }
-
         lock (_writeGate)
         {
             if (_dispatching)
@@ -518,30 +509,7 @@ internal sealed class CtpFrontSession : IDisposable
             else
                 EnqueueOutbound(frame);
         }
-        // 软点之后只有「出站排空」才回收——见 TryRecycleAtSafePoint 的注释。
-        TryRecycleAtSafePoint();
     }
-
-    /// <summary>
-    /// 安全点回收（open-issues #2）：软点已达 **且** 出站队列为空 **且** 没有正在生成的应答/推送，
-    /// 才主动断开。调用点有两处——<see cref="RoutePush"/> 入队后、以及写循环每写完一帧后
-    /// （后者才是「最后一帧真的写到 socket 上了」的那一刻）。
-    /// </summary>
-    private void TryRecycleAtSafePoint()
-    {
-        if (Volatile.Read(ref _rtnRecycleDue) == 0 || _state == State.Closed) return;
-        if (Volatile.Read(ref _outPending) > 0) return;          // 出站还有帧：等写完
-        lock (_writeGate)
-        {
-            if (_dispatching || _captured.Count > 0) return;     // 应答/推送还在生成
-        }
-        if (!TryBeginRecycle()) return;                          // 已被另一条线程消费
-        _log($"[CTP-Front] F0 推送序号达安全点（已过 {RtnSoftLimit}，出站已排空）——主动断开客户端（SDK 自动重连、序号归零）");
-        try { _client.Close(); } catch { }
-    }
-
-    /// <summary>消费「待回收」标记：多线程同时想断时只有一个真的断开。</summary>
-    private bool TryBeginRecycle() => Interlocked.Exchange(ref _rtnRecycleDue, 0) != 0;
 
     /// <summary>出站入队的唯一入口（维持 <see cref="_outPending"/> 与队列一致）。</summary>
     private void EnqueueOutbound(byte[] frame)
