@@ -61,6 +61,39 @@ internal sealed class CtpFrontSession : IDisposable
     /// 真前置只回当日委托；本地账本没有日期维度，用「活单优先 + 封顶」近似，超出部分不回（日志标注）。</summary>
     private const int QueryOrderRowCap = 200;
 
+    /// <summary>
+    /// 多行应答的**唯一**出口：一行一帧、**一帧一次 TCP 写**（持仓/成交/报单/合约四处）。
+    /// <para>
+    /// 2026-10-30 的事故（open-issues #21）：查报单回 200 行后客户端立即断（前置侧「远程主机强迫关闭了一个
+    /// 现有的连接」，客户端侧 `前置断开 reason=4097`），3 秒重连一轮、查询结果全丢。排查时连着错过了两次：
+    /// 先按「单帧 89200B 溢出 2 字节长度域」理解，改成按字节封顶 60000B —— 仍断；再改成逐帧写 —— 仍断。
+    /// **两个「大小」解释都是错的**：真正的卡点是序号。旧实现把第一行序号回显成请求计数器、其后 +1，
+    /// 于是同一连接里前一个查询（持仓）刚用过的流水号又被报单行重复使用；SDK 见到重复/倒流的 80 族流水
+    /// 就停止派发并 RST。实测对照：同一份代码只回 1 行时正常（`报单查询响应 ErrorID=0 isLast=True`），
+    /// 回 ≥2 行必断；把每行改成取新的 NextQrySeq（与持仓/资金同款）后，**200 行 / 89KB 一次查询零断连**。
+    /// </para>
+    /// <para>
+    /// 逐帧写保留（虽然它没能修好 #21）：这是真前置的同款行为，客户端 wrapper 本来就靠静默期收集多行
+    /// （见 CtpTrader.OnQueryItem：tag 帧恒 isLast=true，帧内没有 false 编码），拼成一整块反而是我们自己
+    /// 发明的偏离。单帧 ~446B，和一直没出过事的持仓应答同量级。
+    /// </para>
+    /// <para>
+    /// 返回 null 而不是把字节交回 <see cref="DispatchFrameAsync"/>：帧必须在此处按序入队
+    /// （调用发生在 `_dispatching` 为真的分发窗内，其它线程的推送都被捕获缓冲挡在后面，次序不乱）。
+    /// </para>
+    /// </summary>
+    private byte[]? EnqueueRecords(IReadOnlyList<byte[]> frames, string what, int reqId)
+    {
+        var bytes = 0;
+        foreach (var f in frames)
+        {
+            EnqueueOutbound(f);
+            bytes += f.Length;
+        }
+        _log($"[CTP-Front] {what} reqId={reqId} → 逐帧写出 {frames.Count} 条，{bytes}B");
+        return null;
+    }
+
     // 会话身份（⑤/⑦ 请求中提取）
     private string _userId = "";
     private string _brokerId = "";
@@ -712,11 +745,7 @@ internal sealed class CtpFrontSession : IDisposable
             var frames = positions.Select(p => BuildFrame(CtpFrontTemplates.BuildQryPositionRsp(
                 NextQrySeq(), id, _brokerId, _userId, p.InstrumentId, p.ExchangeId, day,
                 (char)p.PosiDirection, (char)p.PositionDate, p.TotalPosition, p.TodayPosition, _log))).ToArray();
-            var total = frames.Sum(b => b.Length);
-            var buf = new byte[total];
-            var off = 0;
-            foreach (var b in frames) { b.CopyTo(buf, off); off += b.Length; }
-            return buf;
+            return EnqueueRecords(frames, "持仓查询", id);
         }
 
         // 查交易所请求: E1 04 E2 80 2A（真前置 2026-10-24 实抓：应答 op=2B、1 帧 N 条记录，reqId 在 E1 01 E1 0D E3 后）。
@@ -774,10 +803,7 @@ internal sealed class CtpFrontSession : IDisposable
                 NextQrySeq(), tid, _brokerId, _userId, t.InstrumentId, t.ExchangeId, t.OrderRef, t.TradeId,
                 (char)t.Direction, (char)t.OffsetFlag, t.Price, t.Volume,
                 string.IsNullOrEmpty(t.TradeDate) ? day : t.TradeDate, t.TradeTime, day))).ToArray();
-            var tradeBuf = new byte[tradeFrames.Sum(b => b.Length)];
-            var tradeOff = 0;
-            foreach (var b in tradeFrames) { b.CopyTo(tradeBuf, tradeOff); tradeOff += b.Length; }
-            return tradeBuf;
+            return EnqueueRecords(tradeFrames, "查成交", tid);
         }
 
         // 查报单请求: E1 04 E2 80 E4 <计数器>（⑤⑦ 族同款——计数在 op 字节不在 E3）；reqId 在 E1 01 E1 CD E3 后。
@@ -788,10 +814,10 @@ internal sealed class CtpFrontSession : IDisposable
         if (MatchesSignature(body, "E104E280E4"))
         {
             var reqId = ExtractReqIdAfter(body, "E101E1CDE3");
-            // 两个回显槽都取自请求（跨 await 前先取值——body 是 span）：reqId 在 E3 后；
-            // 计数器 = 请求 op 字节之后那个字节（2026-10-24 配对抓包 + 回放探针实证：记录帧该槽
-            // 必须等于请求值，写前置自己的序列号会被 SDK 丢弃 ⇒ 查询 30s 超时）。
-            var counter = body.Length > 5 ? body[5] : (byte)NextQrySeq();
+            // reqId 必须先取（body 是 span，跨 await 后失效）。
+            // 序号槽**不再**回显请求计数器（2026-10-24 曾记录「该槽必须等于请求值」——那条结论已被
+            // 2026-10-30 的 #21 实验推翻：请求回显值会与本连接已用过的流水号重复 ⇒ SDK 停派发并 RST。
+            // 现在每行取新的 NextQrySeq，200 行实测全通，见 EnqueueRecords 注释）。
             var orders = await _rpc.QueryOrdersAsync(null, ct);
             orders = SkipOverWide(orders, o => o.InstrumentId, "查报单");
             if (reqId is not { } id) return null;
@@ -807,18 +833,19 @@ internal sealed class CtpFrontSession : IDisposable
                 var room = QueryOrderRowCap - picked.Count;
                 picked.AddRange(orders.Where(o => (char)o.OrderStatusRaw is not ('1' or '3')).Take(room));
             }
-            _log($"[CTP-Front] 查报单 reqId={id} → 账本 {orders.Count} 条，回 {picked.Count} 行" +
-                 (picked.Count < orders.Count ? $"（活单优先 + 封顶 {QueryOrderRowCap}，其余不回）" : ""));
-            // 多行序号：首行回显请求计数器，其后逐一递增（持仓族同款「每行一个序号」——2026-10-24 实测同号
-            // 的两行只到一行）。
-            var frames = picked.Select((o, i) => BuildFrame(CtpFrontTemplates.BuildQryOrderRsp(
-                counter + i, id, _brokerId, _userId, o.InstrumentId, o.ExchangeId, o.OrderRef,
+            _log($"[CTP-Front] 查报单 reqId={id} → 账本 {orders.Count} 条，选 {picked.Count} 行" +
+                 (picked.Count < orders.Count ? "（活单优先 + 行数封顶 " + QueryOrderRowCap.ToString() + "，其余不回）" : "") +
+                 "；逐帧写出");
+            // 多行序号：**每行取一个新的 80 族流水**（NextQrySeq，与持仓/资金同款）。
+            // 2026-10-30 #21 定案：旧版是「首行回显请求计数器、其后 +1」——那串数会撞上本连接里已经用过的流水
+            // （持仓刚用过 03/04，报单又从 03 起），SDK 见到重复/倒流的流水就停派发并 RST。实测：
+            // 只回 1 行时正常（`报单查询响应 ErrorID=0 isLast=True`），回 ≥2 行必断。
+            // 注意与「查询 30s 超时」的区别：那个槽是请求 op 后那个字节的事，这里只改**响应**流水。
+            var frames = picked.Select(o => BuildFrame(CtpFrontTemplates.BuildQryOrderRsp(
+                NextQrySeq(), id, _brokerId, _userId, o.InstrumentId, o.ExchangeId, o.OrderRef,
                 (char)o.PriceType, (char)o.Direction, (char)o.OffsetFlag, o.LimitPrice, o.VolumeTotalOriginal,
                 o.VolumeTotal, '3', (char)o.OrderStatusRaw, OrderStatusMsg(o), day, o.InsertTime))).ToArray();
-            var buf = new byte[frames.Sum(b => b.Length)];
-            var off = 0;
-            foreach (var b in frames) { b.CopyTo(buf, off); off += b.Length; }
-            return buf;
+            return EnqueueRecords(frames, "查报单", id);
         }
 
         // 终端信息上报: E4 30 E6 05 01 31（SDK 每次登录自动发、真前置不应答——2026-10-03 录制实证）。
@@ -845,11 +872,7 @@ internal sealed class CtpFrontSession : IDisposable
             if (listed.Count == 0) return null;
             var frames = listed.Select(i =>
                 BuildFrame(CtpFrontTemplates.BuildQryInstrumentRsp(NextQrySeq(), qryId, i.InstrumentId, i.ExchangeId))).ToArray();
-            var total = frames.Sum(b => b.Length);
-            var buf = new byte[total];
-            var off = 0;
-            foreach (var b in frames) { b.CopyTo(buf, off); off += b.Length; }
-            return buf;
+            return EnqueueRecords(frames, "查合约", qryId);
         }
 
         // ⑲ 报单: E1 01 E2 40 E4 <计数器> —— 末字节随请求数递增（v2 抓包三单 = 05/06/07），匹配 5 字节前缀。
