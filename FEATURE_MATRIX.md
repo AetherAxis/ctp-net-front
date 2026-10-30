@@ -5,7 +5,7 @@
 > 数据来源：SDK 头文件枚举、`CtpFrontSession`/`CtpFrontMdSession` 的签名分支、`CtpTrader` 的公开方法、
 > `~/aether-bots/simnow/capture/`（真前置实抓，本地留存、永不入 git）。
 > 最后更新：2026-10-30（请求面未变；补一条外部客户端验证——桌面端跨公网连 17802 收 tick，
-> 见 `../../aether-ctp-hosts/doc/ctp-line/README.md`。注意：2026-10-30 17:44 已部署新构建（`front=2e4867b`，含 240 回收删除），但**尚未在真实负载下**跑过长会话；本文所有「已验证」结论仍来自更早的构建）。
+> 见 `../aether-ctp-hosts/doc/ctp-line/README.md`。注意：2026-10-30 17:44 已部署新构建（`front=2e4867b`，含 240 回收删除），但**尚未在真实负载下**跑过长会话；本文所有「已验证」结论仍来自更早的构建）。
 
 ## 0. 总账
 
@@ -28,7 +28,7 @@
 | 2 | `ReqUserLogin` | `E101E23010` | ⑦登录 → ⑩主帧 + 伴随帧 | 解出 FrontID/SessionID/MaxOrderRef |
 | 3 | （SDK 自动）系统信息 | `E43024E501` / `E43027E501` | ⑨ 应答 | 真前置同款 |
 | 4 | （SDK 自动）终端信息采集 | `E430E60501` | 识别并**不应答**（与真前置一致） | 抓包实证 |
-| 5 | `ReqSettlementInfoConfirm` | `E101E24013` | ⑪⑬ → 65B payload | 真前置逐字节一致（golden 测试）+ 本地 E2E `ErrorID=0`；~~服务器上官方 Windows dll 不派发该应答~~ **2026-10-30 11:55 复测已不复现**（新前置 + 新 console + 29 导出胶水，4 次登录全 `ErrorID=0`；根因待 A/B 定案，见 `../../aether-ctp-hosts/doc/ctp-line/open-issues.md` #20） |
+| 5 | `ReqSettlementInfoConfirm` | `E101E24013` | ⑪⑬ → 65B payload | 真前置逐字节一致（golden 测试）+ 本地 E2E `ErrorID=0`；~~服务器上官方 Windows dll 不派发该应答~~ **2026-10-30 11:55 复测已不复现**（新前置 + 新 console + 29 导出胶水，4 次登录全 `ErrorID=0`；根因待 A/B 定案，见 `../aether-ctp-hosts/doc/ctp-line/open-issues.md` #20） |
 | 6 | `ReqQryTradingAccount` | `E104E28006` | ⑮ 资金 → 134B payload | golden 测试 + 实值 999927.69 |
 | 7 | `ReqQryInvestorPosition` | `E104E28004` | ⑰ 持仓 → 逐仓一帧（多行已验证）；**总仓/今仓已真实化**（2026-10-29 探针定位 payload@54 / @150，见 DESIGN §3.10） | 真前置两合约两仓 ⇒ 两行；E2E 5 手全字段对齐 + 300 手截 255 |
 | 8 | `ReqQryInstrument` | `E104E2802E` | 查合约 → 板子表（**名称槽未接线**：④ 品种表 2026-10-26 起带 `Name`（ax001=Aether币价期货）且 RPC/③ `CtpInstrument.Name` 已透传到本仓 mapper——wire 应答帧补 GBK 定宽名称槽属 follow-up，坑参照 P1#6d 查交易所：槽宽错整行被 SDK 静默丢弃） | 真前置 17335 行走二进制，客户端兼容 tag 逐行 |
@@ -126,5 +126,5 @@
 | 撤单在途断连 | 柜台侧动作仍会执行，客户端重连后从委托查询收敛 | 异常抛回客户端，交易所侧可能已执行也可能没执行，**没人管** | 传输不确定的撤单进 `FrontPendingLedger`，该账户下次登录时**幂等重放** |
 | 报单在途断连 | 同上 | 同上，且交易所侧可能留下孤儿活单 | 下次登录查一次委托，仍活着的当**孤儿单撤掉** |
 | 合约号超出槽宽 | 真前置自己也截（`E1` 槽） | 静默截断 ⇒ 变成另一个合约 | **丢该行 + 日志**（`FitsInstrument`，§3.9） |
-| 会话未认证/未登录就发单 | 柜台直接丢弃 | 前置按「非预期帧（等认证）」丢弃，客户端零感知（2026-10-29 事故） | 客户端 `CtpSessionService` 侧就抛 `CtpSessionNotReadyException`（见 `../../ctp-net-client/doc/session-reauth-after-reconnect.md` §7） |
-| 240 条推送后主动断连 | — | 攒满即断（与报单突发撞车） | **已改（2026-10-30）**：软点 240 打标 → 出站排空才断，硬顶 251 立即断（`open-issues` #2，见 `DESIGN.md` §3.11） |
+| 会话未认证/未登录就发单 | 柜台直接丢弃 | 前置按「非预期帧（等认证）」丢弃，客户端零感知（2026-10-29 事故） | 客户端 `CtpSessionService` 侧就抛 `CtpSessionNotReadyException`（见 `../ctp-net-client/doc/session-reauth-after-reconnect.md` §7） |
+| 240 条推送后主动断连 | — | 攒满即断（与报单突发撞车） | **已删除（2026-10-30）**：软点/硬点/安全点回收整体下掉，≥240 只打一行日志、≥65000 才断开；「SDK 只认 1~251」已被 900 帧连推证伪（`open-issues` #2，见 `DESIGN.md` §3.11） |

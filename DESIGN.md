@@ -30,7 +30,7 @@ CTP 线协议前置：客户端连 tcp :17801/:17802，后端经 `SimRpcClient` 
 - **裁判的边界（2026-10-30 补）**：本地 E2E 与服务器用的是**同一个官方 API v6.7.2**
   （`ctp-net-core/ctp-sdk/` 里 macos-universal / win-x64 齐全，胶水各一份），所以「本地过了」在理论上等价于
   「官方 SDK 过了」。**但实测不成立**：⑫ 结算确认应答在 Windows 客户端上不被派发、同字节 macOS 客户端照收
-  （`../../aether-ctp-hosts/doc/ctp-line/open-issues.md` #20，尚未定性）。⇒ 现阶段**平台构建差异本身就是一个变量**，
+  （`../aether-ctp-hosts/doc/ctp-line/open-issues.md` #20，尚未定性）。⇒ 现阶段**平台构建差异本身就是一个变量**，
   新帧/改帧的验收必须在两个平台上各跑一次，不能只信 macOS E2E。
 
 ### 3.2 映射单入口
@@ -155,9 +155,9 @@ CTP 线协议前置：客户端连 tcp :17801/:17802，后端经 `SimRpcClient` 
 「F0 推送序号达安全点（已过 240）——主动断开客户端」，客户端 `前置断开 reason=4097` 重连，
 当场丢 4 笔报单回报 + 27 次撤单失败 ⇒ **断连是回收自己制造的，它防的边界并不存在。**
 
-（当年真正会「静默卡死」的是请求侧的报单帧签名，见 `../../aether-ctp-hosts/doc/ctp-line/open-issues.md` #23，已修。两件事被混成了一件。）
+（当年真正会「静默卡死」的是请求侧的报单帧签名，见 `../aether-ctp-hosts/doc/ctp-line/open-issues.md` #23，已修。两件事被混成了一件。）
 
-**现在的行为**（`CtpFrontSession.NextRtnInstance`，`../../aether-ctp-hosts/doc/ctp-line/open-issues.md` #2）：
+**现在的行为**（`CtpFrontSession.NextRtnInstance`，`../aether-ctp-hosts/doc/ctp-line/open-issues.md` #2）：
 
 | 阶段 | 阈值 | 行为 |
 |---|---|---|
@@ -285,7 +285,7 @@ E3=流水、E7=请求里 `E1 01 E1 CD E3` 后的 reqId）。前置新增同形�
 
 ## 6. 待升级项
 
-> 跨仓的「还剩什么问题、怎么修」统一收在 **`../../aether-ctp-hosts/doc/ctp-line/open-issues.md`**（跨仓总册）。本节是前置本仓视角的明细，
+> 跨仓的「还剩什么问题、怎么修」统一收在 **`../aether-ctp-hosts/doc/ctp-line/open-issues.md`**（跨仓总册）。本节是前置本仓视角的明细，
 > 两边冲突时以总册的盘点日期为准。
 
 | # | 优先级 | 项目 | 现状证据 | 建议 | 代价 / 风险 |
