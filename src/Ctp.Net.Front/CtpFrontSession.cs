@@ -81,8 +81,16 @@ internal sealed class CtpFrontSession : IDisposable
     /// 返回 null 而不是把字节交回 <see cref="DispatchFrameAsync"/>：帧必须在此处按序入队
     /// （调用发生在 `_dispatching` 为真的分发窗内，其它线程的推送都被捕获缓冲挡在后面，次序不乱）。
     /// </para>
+    /// <para>
+    /// <b>出帧侧不变量（2026-10-30 读码定案，见 open-issues #21 的 SDK 反汇编）</b>：每个族
+    /// （80 应答 / F0 推送 / 40 指令）各有独立的序号计数器，**每写一个包取一次 `++`，中途不能空跳、
+    /// 不能重复、不能消耗了却不写**。依据是 `CFTDCSubEndPoint::HandlePackage`：
+    /// <c>if (pkg[+0x30] != 该族上一包 + 1) return -1;</c> —— 整包丢弃。所以「先取序号、再发现不用出帧」
+    /// 这种写法本身就是 bug：它会让本族其后所有应答被客户端静默丢掉，且日志里只看到「查询无应答」。
+    /// 新增出帧分支时：**序号只在确定要 return/push 一帧的分支里取**。
+    /// </para>
     /// </summary>
-    private byte[]? EnqueueRecords(IReadOnlyList<byte[]> frames, string what, int reqId)
+    private byte[]? EnqueueRecords(IReadOnlyList<byte[]> frames, string what, int reqId, int firstSeq)
     {
         var bytes = 0;
         foreach (var f in frames)
@@ -90,7 +98,11 @@ internal sealed class CtpFrontSession : IDisposable
             EnqueueOutbound(f);
             bytes += f.Length;
         }
-        _log($"[CTP-Front] {what} reqId={reqId} → 逐帧写出 {frames.Count} 条，{bytes}B");
+        // 把 80 族流水的**区间**写进日志：SDK 是按「逐包 +1」校验的（open-issues #21 反汇编：
+        // CFTDCSubEndPoint::HandlePackage 见到 ≠ 上一包+1 就整包丢弃），#21 卡了几天就是因为
+        // 日志里只有条数、看不出流水重复。有区间就能和上一轮直接对账。
+        _log($"[CTP-Front] {what} reqId={reqId} → 逐帧写出 {frames.Count} 条，{bytes}B，" +
+             $"流水 {firstSeq}..{firstSeq + frames.Count - 1}");
         return null;
     }
 
@@ -711,11 +723,17 @@ internal sealed class CtpFrontSession : IDisposable
         if (MatchesSignature(body, "E101E24013"))
         {
             var reqId = ExtractReqIdAfter(body, "E101E143E3");
+            // 序号必须在「确定要出帧」之后才消耗：40 族是严格 +1 序列，空跳一格客户端就静默拒收
+            // （见 NextCmdInstance 注释与 open-issues #21 的 SDK 反汇编）。旧写法先取 inst 再判
+            // reqId——请求畸形时序号白耗一格，其后本族所有应答都会被客户端丢弃。
+            if (reqId is not { } id)
+            {
+                _log($"[CTP-Front] 结算确认请求无法解析 reqId——不应答（不消耗序号）: {HexPrefix(body)}");
+                return null;
+            }
             var inst = NextCmdInstance();
-            _log($"[CTP-Front] 结算确认 #{inst} reqId={reqId}");
-            return reqId is { } id
-                ? BuildFrame(CtpFrontTemplates.BuildSettleRsp(inst, id, _brokerId, _userId, day))
-                : null;
+            _log($"[CTP-Front] 结算确认 #{inst} reqId={id}");
+            return BuildFrame(CtpFrontTemplates.BuildSettleRsp(inst, id, _brokerId, _userId, day));
         }
 
         // ⑮ 资金查询请求: E1 04 E2 80 06；reqId 在 E1 2E E3 之后（=05）。
@@ -742,10 +760,11 @@ internal sealed class CtpFrontSession : IDisposable
             positions = SkipOverWide(positions, p => p.InstrumentId, "持仓");
             if (positions.Count == 0)
                 return BuildFrame(CtpFrontTemplates.BuildQryPositionEmptyRsp(NextQrySeq(), id));
+            var firstSeq = _qrySeqInt + 1;
             var frames = positions.Select(p => BuildFrame(CtpFrontTemplates.BuildQryPositionRsp(
                 NextQrySeq(), id, _brokerId, _userId, p.InstrumentId, p.ExchangeId, day,
                 (char)p.PosiDirection, (char)p.PositionDate, p.TotalPosition, p.TodayPosition, _log))).ToArray();
-            return EnqueueRecords(frames, "持仓查询", id);
+            return EnqueueRecords(frames, "持仓查询", id, firstSeq);
         }
 
         // 查交易所请求: E1 04 E2 80 2A（真前置 2026-10-24 实抓：应答 op=2B、1 帧 N 条记录，reqId 在 E1 01 E1 0D E3 后）。
@@ -799,11 +818,12 @@ internal sealed class CtpFrontSession : IDisposable
                 return BuildFrame(CtpFrontTemplates.BuildQryTradeEmptyRsp(NextQrySeq(), tid));
             }
             _log($"[CTP-Front] 查成交 reqId={tid} → {trades.Count} 笔，逐笔一帧");
+            var firstSeq = _qrySeqInt + 1;
             var tradeFrames = trades.Select(t => BuildFrame(CtpFrontTemplates.BuildQryTradeRsp(
                 NextQrySeq(), tid, _brokerId, _userId, t.InstrumentId, t.ExchangeId, t.OrderRef, t.TradeId,
                 (char)t.Direction, (char)t.OffsetFlag, t.Price, t.Volume,
                 string.IsNullOrEmpty(t.TradeDate) ? day : t.TradeDate, t.TradeTime, day))).ToArray();
-            return EnqueueRecords(tradeFrames, "查成交", tid);
+            return EnqueueRecords(tradeFrames, "查成交", tid, firstSeq);
         }
 
         // 查报单请求: E1 04 E2 80 E4 <计数器>（⑤⑦ 族同款——计数在 op 字节不在 E3）；reqId 在 E1 01 E1 CD E3 后。
@@ -841,11 +861,12 @@ internal sealed class CtpFrontSession : IDisposable
             // （持仓刚用过 03/04，报单又从 03 起），SDK 见到重复/倒流的流水就停派发并 RST。实测：
             // 只回 1 行时正常（`报单查询响应 ErrorID=0 isLast=True`），回 ≥2 行必断。
             // 注意与「查询 30s 超时」的区别：那个槽是请求 op 后那个字节的事，这里只改**响应**流水。
+            var firstSeq = _qrySeqInt + 1;
             var frames = picked.Select(o => BuildFrame(CtpFrontTemplates.BuildQryOrderRsp(
                 NextQrySeq(), id, _brokerId, _userId, o.InstrumentId, o.ExchangeId, o.OrderRef,
                 (char)o.PriceType, (char)o.Direction, (char)o.OffsetFlag, o.LimitPrice, o.VolumeTotalOriginal,
                 o.VolumeTotal, '3', (char)o.OrderStatusRaw, OrderStatusMsg(o), day, o.InsertTime))).ToArray();
-            return EnqueueRecords(frames, "查报单", id);
+            return EnqueueRecords(frames, "查报单", id, firstSeq);
         }
 
         // 终端信息上报: E4 30 E6 05 01 31（SDK 每次登录自动发、真前置不应答——2026-10-03 录制实证）。
@@ -870,9 +891,10 @@ internal sealed class CtpFrontSession : IDisposable
             listed = SkipOverWide(listed, i => i.InstrumentId, "查合约", CtpFrontTemplates.InstrumentQueryWidth);
             // 空表仍不应答（真前置对「0 行」的回帧形状没有样本——见 DESIGN.md「6e 已知边界」）。
             if (listed.Count == 0) return null;
+            var firstSeq = _qrySeqInt + 1;
             var frames = listed.Select(i =>
                 BuildFrame(CtpFrontTemplates.BuildQryInstrumentRsp(NextQrySeq(), qryId, i.InstrumentId, i.ExchangeId))).ToArray();
-            return EnqueueRecords(frames, "查合约", qryId);
+            return EnqueueRecords(frames, "查合约", qryId, firstSeq);
         }
 
         // ⑲ 报单: E1 01 E2 40 E4 <计数器> —— 末字节随请求数递增（v2 抓包三单 = 05/06/07），匹配 5 字节前缀。

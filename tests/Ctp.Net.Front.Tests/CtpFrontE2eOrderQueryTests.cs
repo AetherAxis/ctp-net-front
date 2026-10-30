@@ -124,4 +124,30 @@ public sealed class CtpFrontE2eOrderQueryTests : IDisposable
             rows.Select(r => r.InstrumentId).OrderBy(x => x, StringComparer.Ordinal).ToArray());
         Assert.All(rows, r => Assert.Equal('3', (char)r.OrderStatusRaw));
     }
+
+    /// <summary>
+    /// 多行规模回归（open-issues #21）：一次查询回 <b>30 行</b>，官方 SDK 必须全部收到、且**零断连**。
+    /// <para>
+    /// 为什么单独立一条：SDK 是按「每包流水 = 上一包 +1」校验的（`CFTDCSubEndPoint::HandlePackage`，
+    /// 见 #21 反汇编），旧实现每行回显请求计数器 ⇒ 第 2 行起流水重复 ⇒ 客户端停派发并 RST。
+    /// 也就是说**这条用例的裁判就是 SDK 本身**：只要序号方案退化成重复/跳号，这里会以断连或行数不足失败。
+    /// 线上 200 行只在探针里验过（`probe-diag.ps1`），本用例把同一不变量钉进 CI；行数取 30 是为了
+    /// 在「≥2 行」这个真正会炸的边界之上留足余量、又不拖慢测试。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task 查报单_三十张挂单_三十行全部到达且零断连()
+    {
+        const int n = 30;
+        _sim.SeedMaker();
+        using var trader = await LoginAsync();
+        for (var i = 0; i < n; i++)
+            await RestAsync(trader, FrontLoopback.Instrument, 2900 + i, 1);   // 低价买 ⇒ 全部挂在簿上
+
+        var rows = await trader.QueryOrderAsync(FrontLoopback.Broker, User);
+
+        Assert.Equal(n, rows.Count);
+        Assert.All(rows, r => Assert.Equal('3', (char)r.OrderStatusRaw));
+        Assert.All(rows, r => Assert.Equal(FrontLoopback.Instrument, r.InstrumentId));
+    }
 }
