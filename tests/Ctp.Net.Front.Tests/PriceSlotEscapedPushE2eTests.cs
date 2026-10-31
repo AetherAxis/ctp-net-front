@@ -55,14 +55,15 @@ public sealed class PriceSlotEscapedPushE2eTests : IDisposable
     }
 
     /// <summary>
-    /// 2672.0 的三字节价格槽是 <c>40 A4 E0</c>——<b>E0 本身既是标记字节又是转义前缀</b>，最刁的形态：
-    /// 不转义 ⇒ SDK 把 E0 当转义前缀吞掉下一个字节 ⇒ 价格与状态全错；转义 ⇒ <c>40 A4 E0 E0</c> 正常。
-    /// 这份价格还恰好是「可被 3 字节槽精确表示」的（[2048,4096) 区间 ulp = 0.5），回显应当一字不差。
+    /// 2164.5 的三字节价格槽是 <c>40 A0 E9</c>——**旧实现（递减 4 次）在这里仍然脏**：E9→E5 还是标记字节，
+    /// SDK 把价格截成 <c>40 A0</c> 右补零 = 假价 32.0，其后的量/状态/合约全错。所以这条用例在旧代码上必红、
+    /// 在新代码（E0 转义成 <c>40 A0 E0 E9</c>）上必绿——它钉的正是 #33 的那个 bug，不是「转义能不能被接受」而已。
+    /// 这份价格可被 3 字节槽精确表示（[2048,4096) 区间 ulp = 0.5），回显应当一字不差。
     /// </summary>
     [Fact]
     public async Task 价格槽含E0的挂单_报单回报与撤单终态都能被SDK正确解析()
     {
-        const double leakyPrice = 2672.0;   // < maker bid 2999 ⇒ 静默挂单
+        const double leakyPrice = 2164.5;   // < maker bid 2999 ⇒ 静默挂单
         var dir = NewFlowDir();
         Directory.CreateDirectory(dir);
         using var trader = Login(dir);
@@ -83,7 +84,7 @@ public sealed class PriceSlotEscapedPushE2eTests : IDisposable
 
         var accepted = orders.Single(o => o.OrderRef == rest.OrderRef && (char)o.OrderStatusRaw == '3');
         Assert.Equal(Instrument, accepted.InstrumentId);                       // 旧实现这里读到空串
-        Assert.Equal(leakyPrice, accepted.LimitPrice);                // 旧实现这里读到 96
+        Assert.Equal(leakyPrice, accepted.LimitPrice);                // 旧实现这里读到 32.0
         Assert.Equal(1, accepted.VolumeTotalOriginal);
         Assert.Equal(Direction.Buy, accepted.Direction);
 

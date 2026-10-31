@@ -123,7 +123,9 @@ internal sealed class CtpFrontMdSession : IDisposable
         {
             await foreach (var frame in _out.Reader.ReadAllAsync(ct))
             {
-                _log($"→ [{frame.Length}B] {Convert.ToHexString(frame)}");
+                // 行情推送是最高频的出站帧（每 tick 一帧）——默认不落字节，见 FrontFrameTrace 注释。
+                if (FrontFrameTrace.Enabled)
+                    _log($"→ [{frame.Length}B] {Convert.ToHexString(frame)}");
                 await stream.WriteAsync(frame, ct);
             }
         }
@@ -362,8 +364,11 @@ internal sealed class CtpFrontMdSession : IDisposable
             _suppressedTicks = 0;
         }
 
-        _log($"→ 推送 tick: {tick.InstrumentId} last={tick.LastPrice} bid={tick.BidPrice} ask={tick.AskPrice}" +
-             (suppressed > 0 ? $"（去重跳过 {suppressed}）" : ""));
+        // 每 tick 一行也是同步写盘（同一个推送路径）：默认不记，只在「本轮去重跳过了一些 tick」
+        // 或显式开 FrameTrace 时记——前者是异常信号，后者是排障现场。
+        if (FrontFrameTrace.Enabled || suppressed > 0)
+            _log($"→ 推送 tick: {tick.InstrumentId} last={tick.LastPrice} bid={tick.BidPrice} ask={tick.AskPrice}" +
+                 (suppressed > 0 ? $"（去重跳过 {suppressed}）" : ""));
         RoutePush(frame);
     }
 

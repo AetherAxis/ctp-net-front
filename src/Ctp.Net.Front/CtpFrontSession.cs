@@ -61,6 +61,14 @@ internal sealed class CtpFrontSession : IDisposable
     /// 真前置只回当日委托；本地账本没有日期维度，用「活单优先 + 封顶」近似，超出部分不回（日志标注）。</summary>
     private const int QueryOrderRowCap = 200;
 
+    /// <summary>单帧处理硬上限（读循环是串行的，一帧不许无限期占着会话——见 DispatchFrameAsync 注释）。
+    /// 取 4s：客户端对持仓查询的容忍是 5s、对账查报单是 8s——前置必须先于它们收手，
+    /// 否则客户端会先判「超时但连接还在」，那就是半死状态本身。</summary>
+    private static readonly TimeSpan FrameProcessLimit = TimeSpan.FromSeconds(4);
+
+    /// <summary>超过这个耗时就算「慢帧」并记日志（正常查询/报单应 &lt;20ms）。</summary>
+    private const long SlowFrameMs = 200;
+
     /// <summary>
     /// 多行应答的**唯一**出口：一行一帧、**一帧一次 TCP 写**（持仓/成交/报单/合约四处）。
     /// <para>
@@ -199,8 +207,10 @@ internal sealed class CtpFrontSession : IDisposable
         {
             await foreach (var frame in _out.Reader.ReadAllAsync(ct))
             {
-                // 出站帧也记日志——诊断「SDK 收到坏响应后挂死」时需要看见我们到底发了什么字节
-                _log($"[CTP-Front] → [{frame.Length}B] {Convert.ToHexString(frame)}");
+                // 出站帧字节落盘只在诊断时开（默认关）——这一步在唯一写 TCP 的线程上，同步写盘，
+                // 开着它磁盘一抖就把整条会话（应答/回报/心跳）拖成「半死」，见 FrontFrameTrace 注释。
+                if (FrontFrameTrace.Enabled)
+                    _log($"[CTP-Front] → [{frame.Length}B] {Convert.ToHexString(frame)}");
                 await stream.WriteAsync(frame, ct);
                 Interlocked.Decrement(ref _outPending);
             }
@@ -223,12 +233,40 @@ internal sealed class CtpFrontSession : IDisposable
     {
         byte[]? response = null;
         lock (_writeGate) _dispatching = true;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            response = await ProcessFrameAsync(frame, ct);
+            // 处理上限（2026-10-31）：读循环是**单线程串行**的，一笔查询在等交易所 RPC 时，
+            // 这条会话后面所有帧（心跳/报单/其它查询）都停在这行后面——客户端看到的就是
+            // 「持仓查询 5s 未返回」「对账查报单 8s 未返回」，再往后堆积成 rc=-2。
+            // 真前置不会让一笔查询无限期占着会话：它有自己的超时，超了就回错误。
+            // 这里给它一个硬上限：超时即会话不可信（RPC 链路已挂），主动关闭让客户端重连——
+            // 严格优于「半死十几秒后由 SDK 拆链路」（那时客户端还分不清是谁的错）。
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(FrameProcessLimit);
+            response = await ProcessFrameAsync(frame, timeout.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            _log($"[CTP-Front] 帧处理超时 {FrameProcessLimit.TotalSeconds:0}s —— 关闭会话（len={frame.Raw.Length} 前缀={HexPrefix(frame.Payload)}）");
+            throw new TimeoutException($"帧处理超过 {FrameProcessLimit.TotalSeconds:0}s");
+        }
+        catch (Exception ex)
+        {
+            // 单笔请求失败 ≠ 会话该断（2026-10-31，与真前置对齐）。旧行为：任何 RPC 异常都穿到读循环，
+            // 整条会话直接关掉——客户端看到的是「好好跑着突然断线」，而真正的原因只是某一次查询/报单
+            // 的 RPC 失败了。真前置对单笔请求的失败是**回错误码**，会话照常。
+            // 这里只丢这一笔并留痕；超时（上面那条）仍然断会话——那是「整条链路不可信」，性质不同。
+            _log($"[CTP-Front] 帧处理失败（丢该笔，不断会话）: {ex.GetType().Name}: {ex.Message} " +
+                 $"len={frame.Raw.Length} 前缀={HexPrefix(frame.Payload)}");
+            response = null;
         }
         finally
         {
+            // 慢帧可见（2026-10-31）：>200ms 就记一行。读循环是串行的，一帧慢 = 整条会话慢，
+            // 而客户端那边只表现为「某查询超时」。把这行留在日志里，谁慢一眼就看得见。
+            if (sw.ElapsedMilliseconds > SlowFrameMs && _state != State.Closed)
+                _log($"[CTP-Front] 慢帧 {sw.ElapsedMilliseconds}ms len={frame.Raw.Length} 前缀={HexPrefix(frame.Payload)}");
             var hasCaptured = false;
             lock (_writeGate) hasCaptured = _captured.Count > 0;
             if (response is not { Length: > 0 } && hasCaptured)
@@ -521,7 +559,8 @@ internal sealed class CtpFrontSession : IDisposable
     /// <summary>处理一个入站帧，返回应答帧（null = 无应答）。业务分支含 RPC await（交易所跨进程）。</summary>
     private async Task<byte[]?> ProcessFrameAsync(CtpFrame frame, CancellationToken ct)
     {
-        _log($"[CTP-Front] ← {frame}");
+        // 入站帧逐条落盘同样默认关（诊断时开 FrameTrace），语义分支下面照常记录。
+        if (FrontFrameTrace.Enabled) _log($"[CTP-Front] ← {frame}");
 
         if (frame.IsGarbage)
         {
@@ -683,6 +722,9 @@ internal sealed class CtpFrontSession : IDisposable
     {
         var body = frame.Body;
         var day = _login?.TradingDay ?? "";
+        // span 不能跨 await 存活，而这几个查询分支要先 await RPC 再判 reqId：前缀/长度先抄成值。
+        var bodyPrefix = HexPrefix(body);
+        var bodyLen = body.Length;
 
         // ⑨ 系统信息请求: body[0..2] = E4 30 24（SDK 收到 ⑧ 后自动发）
         // → ⑩ 主帧（登录结果：交易日/FrontID/SessionID/MaxOrderRef）+ 伴随帧，两帧一次写回
@@ -735,7 +777,9 @@ internal sealed class CtpFrontSession : IDisposable
             var reqId = ExtractReqIdAfter(body, "E1A6E3");
             var positions = await _rpc.QueryPositionsAsync(null, ct);   // 绑定账户全量
             _log($"[CTP-Front] 持仓查询 reqId={reqId} → {positions.Count} 条");
-            if (reqId is not { } id) return null;
+            // 解析不出 reqId 就回不了关联应答——真前置不会静默丢请求，这里必须留痕，
+            // 否则现场只看到客户端「查询 Ns 未返回」，永远查不到是哪一类帧的形态变了。
+            if (reqId is not { } id) { _log($"[CTP-Front] 查持仓：解析不出 reqId，未应答（前缀={bodyPrefix} len={bodyLen}）"); return null; }
             positions = SkipOverWide(positions, p => p.InstrumentId, "持仓");
             if (positions.Count == 0)
                 return BuildFrame(CtpFrontTemplates.BuildQryPositionEmptyRsp(NextQrySeq(), id));
@@ -753,7 +797,9 @@ internal sealed class CtpFrontSession : IDisposable
         {
             var exchReqId = ExtractReqIdAfter(body, "E101E10DE3");
             var listedForExch = await _rpc.QueryInstrumentsAsync(ct);
-            if (exchReqId is not { } exId) return null;
+            // 解析不出 reqId 就回不了关联应答——真前置不会静默丢请求，这里必须留痕，
+            // 否则现场只看到客户端「查询 Ns 未返回」，永远查不到是哪一类帧的形态变了。
+            if (exchReqId is not { } exId) { _log($"[CTP-Front] 查交易所：解析不出 reqId，未应答（前缀={bodyPrefix} len={bodyLen}）"); return null; }
             var rows = listedForExch.Select(i => i.ExchangeId)
                 .Where(x => !string.IsNullOrWhiteSpace(x))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -777,7 +823,9 @@ internal sealed class CtpFrontSession : IDisposable
         if (MatchesSignature(body, "E104E2803C"))
         {
             var settleReqId = ExtractReqIdAfter(body, "E101E136E3");
-            if (settleReqId is not { } sid) return null;
+            // 解析不出 reqId 就回不了关联应答——真前置不会静默丢请求，这里必须留痕，
+            // 否则现场只看到客户端「查询 Ns 未返回」，永远查不到是哪一类帧的形态变了。
+            if (settleReqId is not { } sid) { _log($"[CTP-Front] 查结算单：解析不出 reqId，未应答（前缀={bodyPrefix} len={bodyLen}）"); return null; }
             _log($"[CTP-Front] 查结算单 reqId={sid} → 13B payload tag 空表（真前置同款形状）");
             return BuildFrame(CtpFrontTemplates.BuildQrySettlementInfoEmptyRsp(NextQrySeq(), sid));
         }
@@ -790,7 +838,9 @@ internal sealed class CtpFrontSession : IDisposable
             var tradeReqId = ExtractReqIdAfter(body, "E101E1CDE3");
             var trades = await _rpc.QueryTradesAsync(null, ct);
             trades = SkipOverWide(trades, t => t.InstrumentId, "查成交");
-            if (tradeReqId is not { } tid) return null;
+            // 解析不出 reqId 就回不了关联应答——真前置不会静默丢请求，这里必须留痕，
+            // 否则现场只看到客户端「查询 Ns 未返回」，永远查不到是哪一类帧的形态变了。
+            if (tradeReqId is not { } tid) { _log($"[CTP-Front] 查成交：解析不出 reqId，未应答（前缀={bodyPrefix} len={bodyLen}）"); return null; }
             if (trades.Count == 0)
             {
                 _log($"[CTP-Front] 查成交 reqId={tid} → 0 笔 → 13B payload tag 空表");
@@ -823,7 +873,9 @@ internal sealed class CtpFrontSession : IDisposable
             // 现在每行取新的 NextQrySeq，200 行实测全通，见 EnqueueRecords 注释）。
             var orders = await _rpc.QueryOrdersAsync(null, ct);
             orders = SkipOverWide(orders, o => o.InstrumentId, "查报单");
-            if (reqId is not { } id) return null;
+            // 解析不出 reqId 就回不了关联应答——真前置不会静默丢请求，这里必须留痕，
+            // 否则现场只看到客户端「查询 Ns 未返回」，永远查不到是哪一类帧的形态变了。
+            if (reqId is not { } id) { _log($"[CTP-Front] 查报单：解析不出 reqId，未应答（前缀={bodyPrefix} len={bodyLen}）"); return null; }
             if (orders.Count == 0)
             {
                 _log($"[CTP-Front] 查报单 reqId={id} → 0 条 → 13B payload tag 空表");
@@ -872,7 +924,9 @@ internal sealed class CtpFrontSession : IDisposable
             var reqId = ExtractReqIdAfter(body, "E101015DE3");
             var listed = await _rpc.QueryInstrumentsAsync(ct);   // Domain CtpInstrument（板子只读 id/交易所）
             _log($"查合约 reqId={reqId} → 上市 {listed.Count} 个: {string.Join(",", listed.Select(i => i.InstrumentId))}");
-            if (reqId is not { } qryId) return null;
+            // 解析不出 reqId 就回不了关联应答——真前置不会静默丢请求，这里必须留痕，
+            // 否则现场只看到客户端「查询 Ns 未返回」，永远查不到是哪一类帧的形态变了。
+            if (reqId is not { } qryId) { _log($"[CTP-Front] 查合约：解析不出 reqId，未应答（前缀={bodyPrefix} len={bodyLen}）"); return null; }
             listed = SkipOverWide(listed, i => i.InstrumentId, "查合约", CtpFrontTemplates.InstrumentQueryWidth);
             // 空表仍不应答（真前置对「0 行」的回帧形状没有样本——见 DESIGN.md「6e 已知边界」）。
             if (listed.Count == 0) return null;
@@ -895,7 +949,8 @@ internal sealed class CtpFrontSession : IDisposable
                 _log($"[CTP-Front] 报单解析失败: body={Convert.ToHexString(body)}");
                 return null;
             }
-            _log($"[CTP-Front] 报单: ref={o.OrderRef} {o.InstrumentId} {(o.Direction == '0' ? "买" : "卖")}{(o.OffsetFlag == '0' ? "开" : "平")} {o.Volume}@{o.LimitPrice} TC={(char)o.TimeCondition} reqId={o.ReqId} body={Convert.ToHexString(body)}");
+            _log($"[CTP-Front] 报单: ref={o.OrderRef} {o.InstrumentId} {(o.Direction == '0' ? "买" : "卖")}{(o.OffsetFlag == '0' ? "开" : "平")} {o.Volume}@{o.LimitPrice} TC={(char)o.TimeCondition} reqId={o.ReqId}"
+                 + (FrontFrameTrace.Enabled ? $" body={Convert.ToHexString(body)}" : ""));
             try
             {
                 // 绑定账户插入（OrderRef 直通）；应答结果弃（成功 = 无应答帧——真 CTP 语义）。
@@ -947,7 +1002,8 @@ internal sealed class CtpFrontSession : IDisposable
                 _log($"[CTP-Front] 撤单解析失败: body={Convert.ToHexString(body)}");
                 return null;
             }
-            _log($"[CTP-Front] 撤单: ref={a.OrderRef} reqId={a.ReqId} body={Convert.ToHexString(body)}");
+            _log($"[CTP-Front] 撤单: ref={a.OrderRef} reqId={a.ReqId}"
+                 + (FrontFrameTrace.Enabled ? $" body={Convert.ToHexString(body)}" : ""));
             var inst = NextCmdInstance();   // 40 族严格序列——一次自增，OK/ERR 共用（空跳一格会被客户端拒收）
             try
             {
