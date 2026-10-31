@@ -140,6 +140,16 @@ internal sealed class CtpFrontSession : IDisposable
     private readonly List<byte[]> _captured = new();
     private volatile bool _dispatching;
 
+    // —— 心跳/收包存活观测（2026-10-31 深夜断连定位）——
+    // 线上每一轮断连都是「客户端 RST」，而前置这边完全看不到**客户端最后一次开口是什么时候**：
+    // 心跳帧只做回射不落日志，所以「客户端是在死前还活着」还是「客户端先静默了十几秒」根本分不清。
+    // 这两个计数器是回答它的唯一手段：会话异常时必须能报出「距上一帧多久 / 整场收到几帧几心跳」。
+    private long _lastRecvTicks;
+    private long _lastHbTicks;
+    private int _recvFrames;
+    private int _recvHeartbeats;
+    private string _lastOpDesc = "无";
+
     public CtpFrontSession(TcpClient client, SimRpcClient rpc, Action<string> log,
         FrontPendingLedger? pending = null, FrontSessionRegistry? sessions = null)
     {
@@ -172,18 +182,34 @@ internal sealed class CtpFrontSession : IDisposable
                     // 心跳回射（协议级 keepalive，不走业务分发/捕获缓冲——任意会话状态都须应答）。
                     // 2026-10-02 DirectTest idle 复现：不回射 ⇒ 客户端应答管线 ~30-60s 停摆
                     // （host 照常收答、客户端全超时无断线事件）——bot 长连接必死。
+                    var nowTicks = Environment.TickCount64;
                     if (frame.IsHeartbeat)
                     {
+                        _recvHeartbeats++;
+                        // 心跳是客户端**应用层还活着**的唯一证据。间隔异常（SDK 正常 ~5s）就落一行，
+                        // 免得死前那段的静默被日志吃掉——判断「谁先死」全靠它。
+                        if (_lastHbTicks != 0 && nowTicks - _lastHbTicks > 6000)
+                            _log($"[CTP-Front] 心跳间隔 {nowTicks - _lastHbTicks}ms（客户端应用层静默过一段）");
+                        _lastHbTicks = nowTicks;
+                        _lastRecvTicks = nowTicks;
                         EnqueueOutbound(CtpFrame.Heartbeat);
                         continue;
                     }
+                    _recvFrames++;
+                    _lastRecvTicks = nowTicks;
+                    _lastOpDesc = $"{frame.Raw.Length}B 前缀={HexPrefix(frame.Payload)}";
                     await DispatchFrameAsync(frame, ct);
                 }
             }
         }
         catch (Exception ex)
         {
-            _log($"[CTP-Front] 会话异常: {ex.Message}");
+            // 「客户端离线多久」必须和异常写在同一行：前端只看得到自己 read 失败，
+            // 分不清是对端应用先死了、还是链路把连接掐了。距上一帧 = 0 意味着它是**说着话被打断**。
+            var gap = _lastRecvTicks == 0 ? -1 : Environment.TickCount64 - _lastRecvTicks;
+            var hbGap = _lastHbTicks == 0 ? -1 : Environment.TickCount64 - _lastHbTicks;
+            _log($"[CTP-Front] 会话异常: {ex.Message}（距上一帧={gap}ms 距上一心跳={hbGap}ms " +
+                 $"收帧={_recvFrames} 心跳={_recvHeartbeats} 最后操作={_lastOpDesc}）");
         }
         finally
         {
@@ -211,12 +237,18 @@ internal sealed class CtpFrontSession : IDisposable
                 // 开着它磁盘一抖就把整条会话（应答/回报/心跳）拖成「半死」，见 FrontFrameTrace 注释。
                 if (FrontFrameTrace.Enabled)
                     _log($"[CTP-Front] → [{frame.Length}B] {Convert.ToHexString(frame)}");
+                // 写阻塞可见（2026-10-31 22:5x 断连定位）：`WriteAsync` 卡住只可能是一个原因——
+                // **客户端不收了**（它的接收窗口满 = 它自己的收包线程被卡住）。读侧 `慢帧` 看不见这个，
+                // 而线上「查询 5s 无应答」正是它：应答已经写进本队列，只是对端读不走。
+                var wsw = System.Diagnostics.Stopwatch.StartNew();
                 await stream.WriteAsync(frame, ct);
                 Interlocked.Decrement(ref _outPending);
+                if (wsw.ElapsedMilliseconds > SlowFrameMs)
+                    _log($"[CTP-Front] 写出慢 {wsw.ElapsedMilliseconds}ms（{frame.Length}B，队列剩余 {_outPending}）——对端不收包");
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { _log($"[CTP-Front] 写循环异常: {ex.Message}"); }
+        catch (Exception ex) { _log($"[CTP-Front] 写循环异常: {ex.Message}（未写出队列剩余 {_outPending} 帧）"); }
     }
 
     /// <summary>
@@ -321,7 +353,11 @@ internal sealed class CtpFrontSession : IDisposable
 
     private int NextRtnInstance()
     {
-        var n = ++_rtnInstanceInt;
+        // **必须是原子自增**（2026-10-31 深夜定位）：本方法有两个并发调用者——
+        // RPC 推送线程（OnRpcOrderPushed/OnRpcTradePushed）与分发线程（⑳/㉑ 的 F 帧），
+        // 而 `++field` 是读-改-写三步。撞在一起就给两帧发出**同一个**序号，
+        // 客户端 HandlePackage 判 `seq != 上一包+1` ⇒ 整包丢弃并拆链路（实测口径见 #21）。
+        var n = Interlocked.Increment(ref _rtnInstanceInt);
         if (n >= RtnWarnLimit && Interlocked.Exchange(ref _rtnWarned, 1) == 0)
             _log($"[CTP-Front] F0 推送序号越过 {RtnWarnLimit}——**不回收**，继续按 E2 双字节编码推送");
         if (n >= RtnOverflowGuard)
@@ -465,19 +501,19 @@ internal sealed class CtpFrontSession : IDisposable
             return;
         }
         _log($"[CTP-Front] → 推送 OnRtnOrder: ref={order.OrderRef} status={(char)order.OrderStatusRaw}");
-        RoutePush(BuildFrame((char)order.OrderStatusRaw switch
+        RoutePush(instance => BuildFrame((char)order.OrderStatusRaw switch
         {
-            '0' => CtpFrontTemplates.BuildRtnOrder0(NextRtnInstance(), _userId, _brokerId, order.InstrumentId, order.OrderRef,
+            '0' => CtpFrontTemplates.BuildRtnOrder0(instance, _userId, _brokerId, order.InstrumentId, order.OrderRef,
                 (char)order.PriceType, (char)order.Direction, (char)order.OffsetFlag, order.LimitPrice, order.VolumeTotalOriginal, '3', _login?.TradingDay ?? ""),
             // 非 '0'/'3' 状态必须带真状态字节——客户端（CtpBrokerage tracker / 期货页）靠它收敛订单生命周期。
             // 掩成 '3' 的后果：'5'/'2'/'4' 终态成「永远在队」僵尸（2026-10-02 双 bot 冻结根因：做市商撤单
             // 后票根永不清 ⇒ 不再重挂）；'1' 部成不可见（做市商无法区分在队/部成）。
             // '3' 模板 + 状态槽(177)/消息槽(219) 等宽编辑，SDK 正常回调（交易所模式双客户端 E2E 钉住）。
             // 边界：部成/终态推送的 VolumeTraded 字段保留捕获 verbatim（成交量回显失真——README 记录）。
-            '1' or '2' or '4' or '5' => CtpFrontTemplates.BuildRtnOrderTerminated(NextRtnInstance(), _userId, _brokerId, order.InstrumentId, order.OrderRef,
+            '1' or '2' or '4' or '5' => CtpFrontTemplates.BuildRtnOrderTerminated(instance, _userId, _brokerId, order.InstrumentId, order.OrderRef,
                 (char)order.PriceType, (char)order.Direction, (char)order.OffsetFlag, order.LimitPrice, order.VolumeTotalOriginal, '3', _login?.TradingDay ?? "",
                 (char)order.OrderStatusRaw, ShortStatusMsg(order)),
-            _ => CtpFrontTemplates.BuildRtnOrder3(NextRtnInstance(), _userId, _brokerId, order.InstrumentId, order.OrderRef,
+            _ => CtpFrontTemplates.BuildRtnOrder3(instance, _userId, _brokerId, order.InstrumentId, order.OrderRef,
                 (char)order.PriceType, (char)order.Direction, (char)order.OffsetFlag, order.LimitPrice, order.VolumeTotalOriginal, '3', _login?.TradingDay ?? ""),
         }) ?? Array.Empty<byte>());
     }
@@ -517,7 +553,7 @@ internal sealed class CtpFrontSession : IDisposable
             return;
         }
         _log($"[CTP-Front] → 推送 OnRtnTrade: ref={trade.OrderRef} {(char)trade.Direction}{(char)trade.OffsetFlag} {trade.Volume}@{trade.Price} id={trade.TradeId}");
-        RoutePush(BuildFrame(CtpFrontTemplates.BuildRtnTrade(NextRtnInstance(), _userId, _brokerId, trade.InstrumentId, trade.OrderRef,
+        RoutePush(instance => BuildFrame(CtpFrontTemplates.BuildRtnTrade(instance, _userId, _brokerId, trade.InstrumentId, trade.OrderRef,
             trade.TradeId, (char)trade.Direction, (char)trade.OffsetFlag, trade.Price, trade.Volume, _login?.TradingDay ?? "")));
     }
 
@@ -537,11 +573,22 @@ internal sealed class CtpFrontSession : IDisposable
         try { _client.Close(); } catch { }
     }
 
-    /// <summary>主动推送入站（core 事件 → wire 帧）。分发期间入捕获缓冲（应答先于推送），否则直写队列。</summary>
-    private void RoutePush(byte[] frame)
+    /// <summary>
+    /// F0（回报推送）入队的唯一入口：**序号在 <see cref="_writeGate"/> 锁内领取并立即入队**。
+    /// <para>
+    /// 为什么非要在锁里领号（2026-10-31 深夜定位）：推送帧的序号原本由调用方在
+    /// <c>BuildRtnOrder…(NextRtnInstance(), …)</c> 里先取、之后才走到锁里入队。两个调用者
+    /// （RPC 推送线程 / 分发线程）各走一遍，就出现「A 先领 10、B 后领 11，B 先入队」——
+    /// 上线顺序变成 11,10。客户端是按**上线顺序**逐包校验 `seq == 上一包+1` 的，
+    /// 见到倒流就整包丢弃并拆链路（表现为我们这边只看到客户端 RST）。
+    /// 号在同一把锁里领、帧在同一把锁里排队 ⇒ 领取顺序 = 入队顺序 = 上线顺序，与线程调度无关。
+    /// </para>
+    /// </summary>
+    private void RoutePush(Func<int, byte[]> build)
     {
         lock (_writeGate)
         {
+            var frame = build(NextRtnInstance());
             if (_dispatching)
                 _captured.Add(frame);
             else
@@ -984,11 +1031,14 @@ internal sealed class CtpFrontSession : IDisposable
                 var (wireId, wireMsg) = WireError(cex);
                 var rsp = BuildFrame(CtpFrontTemplates.BuildOrderInsertRspErr(inst, o.ReqId, wireId, wireMsg,
                     echo.Item1, echo.Item2, echo.Item3, echo.Item4, echo.Item5, echo.Item6, echo.Item7, echo.Item8, echo.Item9, echo.Item10));
-                var rtn = BuildFrame(CtpFrontTemplates.BuildErrRtnOrderInsert(NextRtnInstance(), wireId, wireMsg,
-                    echo.Item1, echo.Item2, echo.Item3, echo.Item4, echo.Item5, echo.Item6, echo.Item7, echo.Item8, echo.Item9, echo.Item10));
-                var both = new byte[rsp.Length + rtn.Length];
-                rsp.CopyTo(both, 0); rtn.CopyTo(both, rsp.Length);
-                return both;
+                // F 帧走推送漏斗而不是 `rsp+rtn` 拼一包（2026-10-31 深夜）：拼包时必须在这里先领 F0 序号，
+                // 而这一行在 await 之后——await 期间 RPC 线程已经给捕获缓冲里的推送领走了更大的号，
+                // 于是「先上线的是大号、后上线的是小号」，客户端逐包 +1 校验当场不成立。
+                // 交给 RoutePush：_dispatching 期间它入捕获缓冲，正好排在应答之后（语义不变），
+                // 序号又与入队同序（顺序正确）。
+                RoutePush(instance => BuildFrame(CtpFrontTemplates.BuildErrRtnOrderInsert(instance, wireId, wireMsg,
+                    echo.Item1, echo.Item2, echo.Item3, echo.Item4, echo.Item5, echo.Item6, echo.Item7, echo.Item8, echo.Item9, echo.Item10)));
+                return rsp;
             }
         }
 
@@ -1022,10 +1072,9 @@ internal sealed class CtpFrontSession : IDisposable
                 var cex = AsCtp(ex);
                 _log($"[CTP-Front] 撤单拒绝: [{cex.ErrorId}] {cex.ErrorMsg}");
                 var rsp = BuildFrame(CtpFrontTemplates.BuildOrderActionRspErr(inst, a.ReqId, WireError(cex).Id, WireError(cex).Msg, _userId, _brokerId, a.OrderRef));
-                var rtn = BuildFrame(CtpFrontTemplates.BuildErrRtnOrderAction(NextRtnInstance(), WireError(cex).Id, WireError(cex).Msg, _userId, _brokerId, a.OrderRef));
-                var both = new byte[rsp.Length + rtn.Length];
-                rsp.CopyTo(both, 0); rtn.CopyTo(both, rsp.Length);
-                return both;
+                // 同上：F 帧必须与推送走同一条领号+入队漏斗（撤单拒绝是最高频的一条路径）。
+                RoutePush(instance => BuildFrame(CtpFrontTemplates.BuildErrRtnOrderAction(instance, WireError(cex).Id, WireError(cex).Msg, _userId, _brokerId, a.OrderRef)));
+                return rsp;
             }
         }
 
