@@ -61,10 +61,13 @@ public sealed class FrontPositionFieldsTests : IDisposable
     }
 
     [Fact]
-    public async Task 超过单字节槽的持仓_按255上报而不是写坏帧()
+    public async Task 超过255手的总仓按真实值上报_今仓受协议上限封在255()
     {
-        // 单字节槽的实测边界：0..255 逐值可用；>255 若「撑宽」会让后续字段整体后移（记录帧定宽遍历 ⇒ 失步），
-        // 所以前置选择截到 255 + 日志。这条测试把这个边界钉住——哪天真的支持加宽，它会先红。
+        // 2026-10-30 定案（探针见 VolumeSlotEncodingTests 的类注释）：
+        //   总仓槽可加宽 —— E7+1B ⇒ 0..255，E6+2B 大端 ⇒ 256..65535；
+        //   今仓槽不可加宽 —— 16 个 tag × 5 种宽度全部解析失步，协议上限 255。
+        // 旧实现两个槽都截到 255，理由是「加宽会失步」：对今仓成立，对总仓不成立。
+        // 生产做市商真实总仓 +487 / -457，风控读的是总仓，所以这一半必须修（open-issues #6）。
         // 300 手保证金约 72 万，沙盒默认 100 万不够 ⇒ 直接补一笔（Deposit 对已入金账户是空操作）
         _sim.Core.CreditQuoteDeposit("mm", (ulong)(5_000_000 * SimTradingCore.QuoteAtomsPerToken));
         _sim.SeedMaker(300);
@@ -76,8 +79,28 @@ public sealed class FrontPositionFieldsTests : IDisposable
         Assert.Equal(300, venue.TotalPosition);
 
         var front = await QueryAsync(User);
-        Assert.Equal(255, front.TotalPosition);        // 截到单字节上限，而不是 NULL/0/写坏帧
-        Assert.Equal(255, front.TodayPosition);
+        Assert.Equal(300, front.TotalPosition);        // 真实值，不再截断
+        Assert.Equal(255, front.TodayPosition);        // 今仓槽协议上限——封顶但仍可读，不是丢行
+    }
+
+    [Fact]
+    public async Task 持仓224手_值字节撞标记区也照样读回()
+    {
+        // 224 = 0xE0，正是 payload 的转义前缀。裸写 `E7 E0` 会让 SDK 丢掉整条记录（探针实测），
+        // 必须写成 `E7 E0 E0`。旧实现既不转义也不截断到安全区 ⇒ 实测持仓落在 224..239 / 254 时
+        // 客户端查到的是「空表」而不是「持仓 224」，比截断更难排查（open-issues #6 同源）。
+        _sim.Core.CreditQuoteDeposit("mm", (ulong)(5_000_000 * SimTradingCore.QuoteAtomsPerToken));
+        _sim.SeedMaker(224);
+        _sim.Deposit(User);
+        CoreBuy(User, 224, 3001);
+
+        var venue = _sim.Core.QueryPositions(SimTradingCore.AccountIdOf(User))
+            .Single(p => p.InstrumentId == FrontLoopback.Instrument);
+        Assert.Equal(224, venue.TotalPosition);
+
+        var front = await QueryAsync(User);
+        Assert.Equal(224, front.TotalPosition);
+        Assert.Equal(224, front.TodayPosition);
     }
 
     private void CoreBuy(string user, int volume, double price) =>

@@ -40,6 +40,23 @@ internal static class CtpOrderWireCodec
     internal const byte OrderInsertOp1B = 0xE4;
     internal const byte OrderInsertOp2B = 0xE3;
 
+    /// <summary>三字节实例的 op 标签——<b>外推值，尚无实抓样本</b>：变宽规律是「宽度 +1 ⇒ 标签字母减 1」
+    /// （1B=`E4`、2B=`E3`，2026-10-30 报单实测；应答侧同款 `E3`/`E2` 位移）。计数 ≥65536 时才会用到，
+    /// 按当前速率（报单/查询各约 0.2-0.3 次/秒）两三天内就会碰到——先认下来，碰上了看日志确认形态。</summary>
+    internal const byte OpTag3B = 0xE2;
+
+    /// <summary>查报单请求的路由头 <c>E1 04 E2 80</c>（应答 op=01）。同族其它查询类型的第 5 字节
+    /// 是固定类型码——02 成交 / 04 持仓 / 06 资金 / 2A 交易所 / 2E 合约 / 3C 结算单——全部 &lt;0xE0，
+    /// 与 op 标签 `E4`/`E3`/`E2` 不撞。</summary>
+    private static ReadOnlySpan<byte> RouteQryOrder => [0xE1, 0x04, 0xE2, 0x80];
+
+    /// <summary>查报单请求里的 reqId 家族标记的**尾 4 字节**（`01 E1 CD E3`，完整形是
+    /// <c>E1 01 E1 CD E3 &lt;reqId&gt;</c>）。不用带前导 E1 的 5 字节：实例号恰为 0x0100 的整数倍时
+    /// （256/512/…，与⑲报单 <see cref="InsertMarkerTail"/> 同一个 SDK 行为）SDK 会把标记前的
+    /// <c>E1</c> 一并吃掉，帧变成 <c>E3 01 E2 | 01 E1 CD E3 …</c>——按 5 字节锚点会漏，
+    /// 而 256 这一帧正是本用例的必中边界（2026-10-31 进程内复现，见 QueryOrderHeaderWidthTests）。</summary>
+    private static ReadOnlySpan<byte> QryOrderReqIdNeedle => [0x01, 0xE1, 0xCD, 0xE3];
+
     /// <summary>
     /// 是不是一张<b>报单</b>请求帧——判据**不依赖 op 字段的字节宽度**。
     /// <para>
@@ -55,8 +72,29 @@ internal static class CtpOrderWireCodec
     internal static bool IsOrderInsert(ReadOnlySpan<byte> body)
         => body.Length > 8
            && body[..4].SequenceEqual(Route40)
-           && body[4] is OrderInsertOp1B or OrderInsertOp2B   // 撤单/结算确认的 op 不在这一族
+           && body[4] is OrderInsertOp1B or OrderInsertOp2B or OpTag3B   // 撤单/结算确认的 op 不在这一族
            && body.IndexOf(InsertMarkerTail) >= 0;
+
+    /// <summary>
+    /// 是不是<b>查报单</b>（<c>ReqQryOrder</c>）请求帧——与⑲报单同一套变宽规则，判据**不依赖 op 宽度**。
+    /// <para>
+    /// 2026-10-31 浸泡实测：SDK 的链路计数 ≤254 时 op 写 <c>E4 &lt;1B&gt;</c>，≥255 改写
+    /// <c>E3 &lt;2B&gt;</c>（前置日志实抓 <c>E104E280E30340…</c>=832、<c>E104E280E32645…</c>=9797）。
+    /// 旧判据把签名钉成 5 字节 <c>E104E280E4</c> ⇒ 越界后每一条查报单都掉进「未知业务帧」**永不应答**：
+    /// SDK 查询管线堵死（30s 白等）⇒ 后续持仓查询 rc=-2 ⇒ 交易腿周期 4097 重连；两个 bot 夜跑十小时
+    /// 全在「持仓吃缓存快照」的盲飞状态（open-issues #26）。
+    /// </para>
+    /// <para>
+    /// 这就是 <c>CtpTrader.QueryRequestCount</c> 注释里 2026-10-15 记下的那个「第 256 个同族请求起换编码」
+    /// 陷阱——当年的规避手段（宿主逼近 256 主动重连）从未实现，正确修法是在这里把加宽形态认下来。
+    /// </para>
+    /// </summary>
+    internal static bool IsQueryOrderRequest(ReadOnlySpan<byte> body)
+        => body.Length > 8
+           && body[..4].SequenceEqual(RouteQryOrder)
+           && body[4] is OrderInsertOp1B or OrderInsertOp2B or OpTag3B
+           // reqId 家族标记——把其它 80 族帧挡在外面（缺它时也无从回 reqId，判未知与不判等价）
+           && body.IndexOf(QryOrderReqIdNeedle) >= 0;
 
     internal static ParsedOrderInsert? ParseOrderInsert(ReadOnlySpan<byte> body)
     {

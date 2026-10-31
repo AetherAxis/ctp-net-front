@@ -150,4 +150,83 @@ public sealed class CtpFrontE2eOrderQueryTests : IDisposable
         Assert.All(rows, r => Assert.Equal('3', (char)r.OrderStatusRaw));
         Assert.All(rows, r => Assert.Equal(FrontLoopback.Instrument, r.InstrumentId));
     }
+
+    /// <summary>
+    /// 多行应答的规模锚（open-issues #30 / #28 前置）：一次查报单回 <b>40 / 80 / 150 / 200 行</b>
+    /// 都必须全到、且零断连。2026-10-31 线上 botmm 每到「200 行、且几乎全是活单」这一步客户端就 RST
+    /// （风暴复盘见 history #30），但**同样的帧在本地 SDK 上不复现**——所以这里钉的不是那个未定根因，
+    /// 而是前置这一侧的不变量：行数、逐帧顺序、流水连续性任何一处退化，这里先炸。
+    /// <para>
+    /// 必须等足回报：<c>OrderInsertAsync</c> 是「发送即返回」（异步回报），200 条下单单靠 SDK
+    /// 自己吐，早查会查出半截——第一版就因此假象「40 行封顶」（真正的封顶在 200 行处）。
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(40)]
+    [InlineData(80)]
+    [InlineData(150)]
+    [InlineData(200)]
+    public async Task 查报单_多行应答_行数不受限且零断连(int n)
+    {
+        _sim.SeedMaker();
+        using var trader = await LoginAsync();
+        var disconnected = false;
+        trader.FrontDisconnected += (_, _) => disconnected = true;
+        var confirmed = new HashSet<string>(StringComparer.Ordinal);
+        trader.OrderReceived += (_, o) => { lock (confirmed) confirmed.Add(o.OrderRef); };
+
+        var refs = new List<string>(n);
+        for (var i = 0; i < n; i++)
+            refs.Add((await RestAsync(trader, FrontLoopback.Instrument, 100 + i, 1)).OrderRef);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.Elapsed < TimeSpan.FromSeconds(30))
+        {
+            int got;
+            lock (confirmed) got = refs.Count(confirmed.Contains);
+            if (got == n) break;
+            await Task.Delay(20);
+        }
+        int acked;
+        lock (confirmed) acked = refs.Count(confirmed.Contains);
+        Assert.Equal(n, acked);   // 报单回报先到齐——否则下面查出的行数没有裁判意义
+
+        var rows = await trader.QueryOrderAsync(FrontLoopback.Broker, User);
+
+        Assert.False(disconnected, $"查报单 {rows.Count} 行后客户端断连——行数 {(rows.Count)} 触发 SDK 侧边界");
+        Assert.Equal(n, rows.Count);
+        Assert.All(rows, r => Assert.Equal('3', (char)r.OrderStatusRaw));
+    }
+
+    /// <summary>
+    /// 同一会话连打 <b>300 次</b>查报单、跨过 SDK 链路计数的 255 边界——**每一次都必须有应答**。
+    /// <para>
+    /// 为什么单独立一条（open-issues #26）：查报单请求的 op/实例字段随链路计数变宽
+    /// （≤254 写 <c>E4 &lt;1B&gt;</c>，≥255 写 <c>E3 &lt;2B&gt;</c>，与⑲报单的 #23 同款）。
+    /// 前置若把签名钉死在 <c>E104E280E4</c>，越界后的请求会全部落进「未知业务帧」**永不应答**，
+    /// SDK 查询管线随即堵死——现场表现就是「持仓吃缓存快照 + 周期 4097 重连 + 一切查询 rc=-2」。
+    /// 裁判仍是 SDK 本身：应答缺一帧，这里就以超时失败。
+    /// </para>
+    /// <para>
+    /// 注：本测试在进程内跑，若某版 SDK 的加宽计数是按「会话」而非「进程」计，300 次照样跨线；
+    /// 若该 SDK 版本根本不加宽，本用例退化为「连续查询无假死」的覆盖（仍有价值，只是不再是回归钉）。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task 查报单_同会话连打300次_跨过计数255仍每次应答()
+    {
+        const int n = 300;
+        _sim.SeedMaker();
+        using var trader = await LoginAsync();
+        await RestAsync(trader, FrontLoopback.Instrument, 2900, 1);
+
+        for (var i = 1; i <= n; i++)
+        {
+            var q = trader.QueryOrderAsync(FrontLoopback.Broker, User);
+            var done = await Task.WhenAny(q, Task.Delay(TimeSpan.FromSeconds(5)));
+            Assert.True(done == q, $"第 {i} 次查报单 5s 无应答——大概率是 op 加宽形态没被识别（前置日志: {_sim.LogPath}）");
+            await q;   // 同步出结果/异常，防吞
+            await Task.Delay(60);
+        }
+    }
 }

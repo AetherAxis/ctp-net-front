@@ -805,14 +805,18 @@ internal sealed class CtpFrontSession : IDisposable
             return EnqueueRecords(tradeFrames, "查成交", tid, firstSeq);
         }
 
-        // 查报单请求: E1 04 E2 80 E4 <计数器>（⑤⑦ 族同款——计数在 op 字节不在 E3）；reqId 在 E1 01 E1 CD E3 后。
+        // 查报单请求: E1 04 E2 80 <op/实例字段>；reqId 在 E1 01 E1 CD E3 后。
+        // **op 字段随链路计数变宽**（≤254 写 E4+1B，≥255 写 E3+2B）——判据走 CtpOrderWireCodec.IsQueryOrderRequest，
+        // 不再钉死 5 字节。2026-10-31 浸泡实测：签名钉死后计数越界，查报单全成「未知业务帧」永不应答 ⇒
+        // 查询管线堵死 ⇒ 持仓查询 rc=-2 + 周期 4097 重连（open-issues #26；同款变宽在⑲报单上是 #23）。
         // **必须应答**（2026-10-03 双 bot 实测：未应答的查报单把客户端查询管线堵死 30s，
         // Lean 引擎 GetCashBalance 排队超时 → cash=0 → 引擎侧 buying power 拒掉全部订单）。
         // 空表 = 17B tag 帧（真前置实抓逐字节）。非空 = 每张委托一帧 tag 记录帧（⑯ 模板，2026-10-24 逆向完成）：
         // 真前置 1 行回该 tag 帧、≥2 行走列式二进制；本前置恒用 tag 帧逐行（与持仓同款，多行靠 wrapper 静默期收尾）。
-        if (MatchesSignature(body, "E104E280E4"))
+        if (CtpOrderWireCodec.IsQueryOrderRequest(body))
         {
-            var reqId = ExtractReqIdAfter(body, "E101E1CDE3");
+            // 尾 4 字节锚点（实例号 0x0100 倍数时 SDK 会吃掉标记前的 E1——与⑲报单同款，见 codec 注释）。
+            var reqId = ExtractReqIdAfter(body, "01E1CDE3");
             // reqId 必须先取（body 是 span，跨 await 后失效）。
             // 序号槽**不再**回显请求计数器（2026-10-24 曾记录「该槽必须等于请求值」——那条结论已被
             // 2026-10-30 的 #21 实验推翻：请求回显值会与本连接已用过的流水号重复 ⇒ SDK 停派发并 RST。
@@ -830,7 +834,9 @@ internal sealed class CtpFrontSession : IDisposable
             if (picked.Count < QueryOrderRowCap)
             {
                 var room = QueryOrderRowCap - picked.Count;
-                picked.AddRange(orders.Where(o => (char)o.OrderStatusRaw is not ('1' or '3')).Take(room));
+                // 填充取**最新**的终态（账本插入序 = 最旧在前）。交易所重启作废的挂单在尾部——
+                // 取头部的话对账方永远看不到「刚被作废」的那批（2026-10-30 console bot 对账实测）。
+                picked.AddRange(orders.Where(o => (char)o.OrderStatusRaw is not ('1' or '3')).TakeLast(room));
             }
             _log($"[CTP-Front] 查报单 reqId={id} → 账本 {orders.Count} 条，选 {picked.Count} 行" +
                  (picked.Count < orders.Count ? "（活单优先 + 行数封顶 " + QueryOrderRowCap.ToString() + "，其余不回）" : "") +

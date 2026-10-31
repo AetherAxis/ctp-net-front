@@ -109,7 +109,20 @@ internal static class CtpFrontTemplates
     /// 最近值回显可能比真实价低 0.0044 ⇒ noise 的 IOC 限价够不到真实卖价 ⇒ 双 bot 市场恒不成交——2026-10-13
     /// 本地双 bot 实测；成交仍按 maker 价，ceil 无经济副作用）；②剥/补尾零到恒 width；③避开 tag 字母表字节
     /// （E0..EF/FE——值内出现会被「读到下一 tag」式解析截断，SDK ⑲ 请求侧对含 tag 字节的价格做 E0 转义
-    /// 实证了这一点；递减 1 ulp 让位，量化回显本就近似）。
+    /// 实证了这一点；现行走 E0 转义，见下）。
+    /// <para>
+    /// <b>③ 的旧实现只递减 4 次，2026-10-31 实测漏了整整 12 个连续 tick（open-issues #33 的根因）</b>：
+    /// 价格 99.703125 的三字节槽是 <c>40 58 ED</c>，最低字节在字母表里，减 4 次仍停在 <c>40 58 E9</c>（还是字母表）
+    /// —— 一个 tag 字节被写进价格值，官方 SDK 在价格处按标记截断 ⇒ 其后的量/状态/合约整体错位：
+    /// 客户端看到 <c>BuyOpen 0@96 成0 状态=(空)</c>（96 就是 <c>40 58</c> 右补零解出来的假价），报单
+    /// 永远进不了终态 ⇒ MM 撤腿后空转、市场静默。同一批里 99.796875（<c>40 58 F3</c>，F3 不在字母表）
+    /// 则一切正常 —— 「相邻一笔好、这一笔全空」正是这个字节决定的。
+    /// 现改为：值内出现标记字节就走 <see cref="EscapedValue"/>（宽度 +1B/每个被转义字节），
+    /// <b>不再用「递减 1 ulp 让位」</b>——三字节槽在 [64,128) 区间的 ulp 恰好是 1/64 = 一个 catalog tick，
+    /// 而最低字节落在 E0..EF 时要退 9~16 个 ulp 才出区，报单价最多偏 0.25，回报价就不可信了。
+    /// 转义对「标记界定的值 run」合法（<see cref="EscapedMoney"/> 在资金/结算帧上早有实证），
+    /// 代价只是该帧 +1B。
+    /// </para>
     /// </summary>
     internal static byte[] PriceSlot(double v, int width = 3, bool? roundUp = null)
     {
@@ -136,21 +149,15 @@ internal static class CtpFrontTemplates
         var n = width;
         while (n > 1 && raw[n - 1] == 0) n--;
         var slot = n >= width ? raw[..width].ToArray() : Cat(raw[..n], new byte[width - n]);
-        // ③ 避开 tag 字母表（E0..EF/FE）：递减 1 ulp 让位（big-endian 减法；全 0 放弃——0 值天然无 tag 字节）
-        for (var guardI = 0; guardI < 4 && slot.Any(b => b is (>= 0xE0 and <= 0xEF) or 0xFE); guardI++)
-        {
-            var done = false;
-            for (var i = width - 1; i >= 0; i--)
-            {
-                if (slot[i] == 0) { slot[i] = 0xFF; continue; }
-                slot[i]--;
-                done = true;
-                break;
-            }
-            if (!done) break;
-        }
-        return slot;
+        // ③ 值内出现标记字节 ⇒ E0 转义（**不做让位**：3 字节槽在 [64,128) 区间的 ulp 恰好是 1/64
+        //    = 一个 catalog tick，而最低字节落进 E0..EF 时要走 9~16 个 ulp 才出区 ⇒ 让位后报单价最多
+        //    偏 0.25（16 个 tick），报单回报的价格就不可信了）。转义把价格一字不差地保留，宽度伸缩由
+        //    「标记界定的值 run」吸收 —— EscapedMoney / EscapedValue 同一纪律，资金/结算帧早已这么用。
+        return IsTagFree(slot) ? slot : EscapedValue(slot);
     }
+
+    /// <summary>槽内没有标记字节（E0..EF/FE）——有就得走 E0 转义，否则 SDK 在值中间断句。</summary>
+    private static bool IsTagFree(byte[] slot) => !slot.Any(b => b is (>= 0xE0 and <= 0xEF) or 0xFE);
 
     /// <summary>大端 double 剥尾零（8000.0 → 40BF40 三字节——⑲/推送价格实证；整槽替换宽度随值）。</summary>
     internal static byte[] TrimmedDouble(double v)
@@ -386,10 +393,12 @@ internal static class CtpFrontTemplates
     /// </summary>
     /// <summary>
     /// 测试钩子（2026-10-29 槽位探针）：持仓记录帧写完后允许测试逐字节改写，用来定位「客户端真正读的是哪个槽」。
-    /// 生产恒为 null。<b>为什么需要它</b>：原「E7 槽 = 总仓」的结论只用过 1 手样本验证，而捕获模板本身
-    /// 就是 1 手 ⇒ 写入值与被覆盖的常量同值，假阳性无法区分；这次用 5 手暴露出来（客户端仍读到 1）。
+    /// 生产恒为 null。<b>为什么留着</b>：原「E7 槽 = 总仓」的结论只用过 1 手样本验证，而捕获模板本身
+    /// 就是 1 手 ⇒ 写入值与被覆盖的常量同值，假阳性无法区分；5 手样本才把它暴露出来。下次要定位别的槽
+    /// （查报单/查成交的字段）还得靠同一招：改写 → 官方 SDK 回读 → 看值变不变。所以要新增槽位时，
+    /// 先加钩子、跑一遍再做结论。
     /// </summary>
-    internal static Action<byte[]>? QryPositionRecordHook;
+    internal static Func<byte[], byte[]>? QryPositionRecordHook;
 
     internal static byte[] BuildQryPositionRsp(int instance, byte reqId, string brokerId, string investorId,
         string instrumentId, string exchangeId, string tradingDay, char directionChar, char positionDateChar,
@@ -402,13 +411,14 @@ internal static class CtpFrontTemplates
             new Edit(38, 6, F(investorId, 6)),
             new Edit(45, 4, F(brokerId, 4)),
             new Edit(50, 3, A($"{directionChar}{'1'}{positionDateChar}")),
-            // 量槽捕获 1B（E7 tag + MinimalInt）——总仓 ≥256 时 MinimalInt 2B 撑宽（MM 仓限 ±200 达不到；
-            // SDK 请求侧对大整数有 E7 切换惯例但本槽 tag 已是 E7，未实测边界——如实撑宽）。
-            new Edit(54, 1, VolumeSlot(totalPosition, 54, "总仓", warn)),
-            // 今仓槽 = payload offset 150（2026-10-29 探针定位：该字节 1→7 时客户端 TodayPosition 恰好 1→7，
-            // 0/5/100/255 全部逐一验证；同批确认 54 = 总仓）。此前该槽一直是捕获常量 1 ⇒
+            // 量槽 = 模板里的 tag 字节 + 值字节，一起替换（tag 不能另加：模板 payload@53 已经是 E7，
+            // 只在 54 写值会在线上变成 `E7 E7 xx`——2026-10-30 就是这么把客户端读到的总仓变成 0 的）。
+            // ≤255 用原 tag + 1B；>255 换成 E6 + 2B 大端（见 VolumeSlot）。
+            new Edit(53, 2, VolumeSlot(totalPosition, 0xE7, widen: true, 53, "总仓", warn)),
+            // 今仓槽 = tag@149(E1) + 值@150（2026-10-29 探针定位：该字节 1→7 时客户端 TodayPosition 恰好 1→7，
+            // 0/5/100/255 全部逐一验证；同批确认 53/54 = 总仓）。此前该槽一直是捕获常量 1 ⇒
             // 客户端永远看到「今仓 1」，昨夜仓与今仓的拆分不可信。
-            new Edit(150, 1, VolumeSlot(todayPosition, 150, "今仓", warn)),
+            new Edit(149, 2, VolumeSlot(todayPosition, 0xE1, widen: false, 149, "今仓", warn)),
             new Edit(123, 8, A(tradingDay)),
             new Edit(163, 3, F(exchangeId, 3)),
             new Edit(167, 4, F(instrumentId, 4)),
@@ -419,24 +429,46 @@ internal static class CtpFrontTemplates
         ));
 
     /// <summary>
-    /// 单字节量槽写入。槽宽 1B 是抓包实证（`E7 01` / `E1 01`），实测 0..255 逐值可用；
-    /// 超过 255 时**截到 255 并告警**——旧注释里「MinimalInt 2B 撑宽」是未验证的猜测，
-    /// 撑宽会整体后移后续字段（记录帧是定宽遍历的，2026-10-13 那类断连风暴的成因），
-    /// 所以这里选择「小而不崩 + 明确日志」，而不是拿帧宽去赌。
+    /// 量槽写入：值 ≤255 用模板原 tag（总仓 `E7`、今仓 `E1`）+ 1 字节；总仓 &gt;255 换 `E6` + 2 字节大端。
+    /// 返回的字节含 tag，调用方要连 tag 一起替换。上限见下。
+    /// <para>
+    /// <b>2026-10-30 探针定案（官方 SDK 当裁判：改写字节 → 重登 → 回读字段值）</b>：
+    /// <list type="bullet">
+    /// <item>总仓槽（payload@53）是**可加宽**的：`E7`+1B 读 0..255，`E6`+2B 大端读 256..65535
+    /// （300/480/5000/65535 逐一实证）；`E6` 之后再宽（4B/8B）整条丢行。</item>
+    /// <item>今仓槽（payload@149）**不可加宽**：`E1`+1B 正常（含 `E0` 转义），但只要后面跟 2B/3B/4B/5B/8B
+    /// 的值——`E1..EF`、`FE` 全 16 个 tag 都试过——SDK 一律解析失步：总仓还读得出 300，后面的合约/交易所
+    /// 全部变空，客户端拿到的是一条残行。⇒ 今仓的协议上限就是 255。</item>
+    /// <item>值字节落进标记区（{E0..EF,FE}）必须走 <see cref="EscapedValue"/>：裸写 `E7 E0` 丢行，
+    /// `E7 E0 E0` 读回 224。旧实现没转义 ⇒ 持仓 224..239 / 254 一直在丢整行。</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// 因此本方法对总仓支持到 65535，对今仓仍封顶 255（超了告警留痕，不静默）。
+    /// 「加宽会失步」的旧理由只对今仓成立，对总仓不成立。
+    /// </para>
     /// </summary>
-    private static byte[] VolumeSlot(int value, int offset, string what, Action<string>? warn)
+    internal static byte[] VolumeSlot(int value, byte narrowTag, bool widen, int offset, string what,
+        Action<string>? warn = null)
     {
-        var v = Math.Clamp(value, 0, 255);
-        if (v != value)
-            warn?.Invoke($"[CTP-Front] 持仓{what}={value} 超过单字节槽上限，按 255 上报（槽在 payload@{offset}，加宽会失步）");
-        return [(byte)v];
+        var cap = widen ? 65_535 : 255;
+        var v = value;
+        if (v < 0)
+        {
+            warn?.Invoke($"[CTP-Front] 持仓{what}={value} 为负（槽在 payload@{offset}），按 0 上报");
+            v = 0;
+        }
+        else if (v > cap)
+        {
+            warn?.Invoke($"[CTP-Front] 持仓{what}={value} 超出该槽协议上限 {cap}（槽在 payload@{offset}），按 {cap} 上报");
+            v = cap;
+        }
+        if (!widen || v <= 255)
+            return [narrowTag, .. EscapedValue((byte)v)];
+        return [0xE6, .. EscapedValue([(byte)(v >> 8), (byte)v])];
     }
 
-    private static byte[] Hooked(byte[] record)
-    {
-        QryPositionRecordHook?.Invoke(record);
-        return record;
-    }
+    private static byte[] Hooked(byte[] record) => QryPositionRecordHook?.Invoke(record) ?? record;
 
     /// <summary>
     /// 查报单空应答（13B payload / 17B 线上——2026-10-03 SimNow 实抓：过滤无匹配报单的合约时真前置回此 tag
@@ -599,7 +631,7 @@ internal static class CtpFrontTemplates
             new Edit(113, 5, F(instrumentId, 5)),
             new Edit(120, 1, [(byte)offsetFlag]),
             new Edit(122, 3, PriceSlot(price)),
-            new Edit(126, 1, MinimalInt(volume)),
+            new Edit(126, 1, EscapedValue(MinimalInt(volume))),
             new Edit(127, 8, F(tradeDate, 8)),
             new Edit(136, 8, F(tradeTime, 8)),
             new Edit(168, 4, F(brokerId, 4)),
@@ -848,8 +880,8 @@ internal static class CtpFrontTemplates
     /// （1B 量 + TC）；≥256 切 E7 + 2B 量 + TC（镜像 SDK ⑲ 请求侧自编码惯例——量 tag 随宽度变，E8=1B/E7=2B；
     /// 响应方向未实测——bot 量级 ≤ MaxOrderVolume 远达不到，防御性对齐）。</summary>
     private static Edit VolumeEdit(int offset, int volume, char timeCondition) => volume <= 255
-        ? new Edit(offset, 2, Cat(MinimalInt(volume), A(timeCondition.ToString())))
-        : new Edit(offset - 1, 3, Cat(H("E7"), MinimalInt(volume), A(timeCondition.ToString())));
+        ? new Edit(offset, 2, Cat(EscapedValue(MinimalInt(volume)), A(timeCondition.ToString())))
+        : new Edit(offset - 1, 3, Cat(H("E7"), EscapedValue(MinimalInt(volume)), A(timeCondition.ToString())));
 
     // ===== M2 帧 OnRtnTrade（283B payload：成交回报推送——F002） =====
     internal static readonly byte[] RtnTradeTemplate = H(
@@ -873,7 +905,7 @@ internal static class CtpFrontTemplates
             new Edit(119, 1, A(offsetFlag.ToString())),
             new Edit(82, 1, A(direction.ToString())),
             new Edit(121, 3, PriceSlot(price)),
-            new Edit(125, 1, MinimalInt(volume)),
+            new Edit(125, 1, EscapedValue(MinimalInt(volume))),
             new Edit(33, 6, F(userId, 6)),
             new Edit(65, 6, F(userId, 6)),
             new Edit(22, 4, F(brokerId, 4)),
@@ -904,7 +936,7 @@ internal static class CtpFrontTemplates
             new Edit(100, 12, F(orderRef, 12)),
             new Edit(120, 3, A($"{priceType}{direction}{offsetFlag}")),
             new Edit(126, 3, PriceSlot(limitPrice)),
-            new Edit(130, 2, Cat(MinimalInt(volume), A(timeCondition.ToString()))),
+            new Edit(130, 2, Cat(EscapedValue(MinimalInt(volume)), A(timeCondition.ToString()))),
             new Edit(85, 6, F(userId, 6)),
             new Edit(113, 6, F(userId, 6)),
             new Edit(80, 4, F(brokerId, 4)),
@@ -926,7 +958,7 @@ internal static class CtpFrontTemplates
             new Edit(41, 12, F(orderRef, 12)),
             new Edit(61, 3, A($"{priceType}{direction}{offsetFlag}")),
             new Edit(67, 3, PriceSlot(limitPrice)),
-            new Edit(71, 2, Cat(MinimalInt(volume), A(timeCondition.ToString()))),
+            new Edit(71, 2, Cat(EscapedValue(MinimalInt(volume)), A(timeCondition.ToString()))),
             new Edit(26, 6, F(userId, 6)),
             new Edit(54, 6, F(userId, 6)),
             new Edit(21, 4, F(brokerId, 4)),
